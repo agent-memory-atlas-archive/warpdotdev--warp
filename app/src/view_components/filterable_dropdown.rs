@@ -393,6 +393,17 @@ where
             _ => None,
         }
     }
+    pub fn selected_action(&self) -> Option<A>
+    where
+        A: Clone,
+    {
+        let DropdownAction::SelectActionAndClose(action) =
+            self.selected_item.as_ref()?.item_on_select_action()?
+        else {
+            return None;
+        };
+        (**action).as_any().downcast_ref::<A>().cloned()
+    }
 
     fn focus(&mut self, _delta: usize, ctx: &mut ViewContext<Self>) {
         if self.is_expanded {
