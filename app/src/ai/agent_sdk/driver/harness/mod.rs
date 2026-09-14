@@ -50,7 +50,6 @@ mod save_coordinator;
 mod skill_dirs_publish;
 mod telemetry;
 mod usage_reporting;
-use usage_reporting::UsageReporter;
 pub(crate) use claude_code::ClaudeHarness;
 use claude_transcript::ClaudeResumeInfo;
 use codex::CodexHarness;
@@ -58,6 +57,7 @@ use codex_transcript::CodexResumeInfo;
 use gemini::GeminiHarness;
 use save_coordinator::{SaveCoordinator, final_save_budget};
 pub(crate) use telemetry::ThirdPartyHarnessTelemetryEvent;
+use usage_reporting::UsageReporter;
 
 /// Harness-agnostic payload describing how to resume an existing conversation.
 ///
