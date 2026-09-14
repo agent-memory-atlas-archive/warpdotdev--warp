@@ -93,6 +93,7 @@ use crate::server::server_api::ai::{AIClient, TaskGitCredentialsError, TaskStatu
 use crate::server::server_api::harness_support::{
     HarnessSupportClient, ResolvePromptAttachedSkill, ResolvePromptRequest,
 };
+use crate::server::telemetry::secret_redaction::redact_secrets_in_string;
 use crate::terminal::cli_agent_sessions::plugin_manager::{
     CliAgentPluginManager, plugin_manager_for,
 };
@@ -201,7 +202,6 @@ const HARNESS_FAILURE_OUTPUT_TRUNCATION_MARKER: &str = "\n… harness output tru
 pub(crate) const WARP_DRIVE_SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn truncate_harness_failure_output(output: &str) -> String {
-    let output = output.trim();
     if output.len() <= HARNESS_FAILURE_OUTPUT_MAX_BYTES {
         return output.to_owned();
     }
@@ -227,6 +227,13 @@ fn truncate_harness_failure_output(output: &str) -> String {
         HARNESS_FAILURE_OUTPUT_TRUNCATION_MARKER,
         &output[suffix_start..]
     )
+}
+
+fn prepare_harness_failure_output(output: &str) -> String {
+    let mut output = output.trim().to_owned();
+    // Redact before truncation so splitting a credential cannot hide it from detection.
+    redact_secrets_in_string(&mut output);
+    truncate_harness_failure_output(&output)
 }
 /// Maximum time to wait for an automatic error resume before propagating the error.
 /// If no follow-up status arrives within this window, the driver terminates with the
@@ -3361,7 +3368,7 @@ impl AgentDriver {
             .await
             .ok()
             .flatten()
-            .map(|output| truncate_harness_failure_output(&output))
+            .map(|output| prepare_harness_failure_output(&output))
             .filter(|output| !output.is_empty())
     }
 
