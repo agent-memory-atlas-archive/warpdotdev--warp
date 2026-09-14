@@ -400,9 +400,24 @@ impl LocalAgentTaskSyncModel {
     fn send_update(
         &mut self,
         task_id: AmbientAgentTaskId,
-        update: LocalTaskUpdate,
+        mut update: LocalTaskUpdate,
         ctx: &mut ModelContext<Self>,
     ) {
+        if update.task_state.is_some_and(|state| {
+            is_terminal_task_state(state)
+                && self.confirmed_terminal_states.get(&task_id) == Some(&state)
+        }) {
+            update.task_state = None;
+            update.status_message = None;
+        }
+        if update.is_empty() {
+            if let Some(update) = self.update_queue.record_result(task_id, true) {
+                self.send_update(task_id, update, ctx);
+            } else if self.update_queue.is_idle(&task_id) {
+                self.notify_idle_waiters(&task_id);
+            }
+            return;
+        }
         let ai_client = self.ai_client.clone();
         let LocalTaskUpdate {
             task_state,
@@ -435,9 +450,12 @@ impl LocalAgentTaskSyncModel {
             move |me, result, ctx| {
                 if result.is_ok()
                     && let Some(state) = task_state
-                    && is_terminal_task_state(state)
                 {
-                    me.confirmed_terminal_states.insert(task_id, state);
+                    if is_terminal_task_state(state) {
+                        me.confirmed_terminal_states.insert(task_id, state);
+                    } else {
+                        me.confirmed_terminal_states.remove(&task_id);
+                    }
                 }
                 if let Some(update) = me.update_queue.record_result(task_id, result.is_ok()) {
                     me.send_update(task_id, update, ctx);
