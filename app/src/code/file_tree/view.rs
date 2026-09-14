@@ -33,6 +33,7 @@ use warpui::fonts::{Properties, Style, Weight};
 use warpui::keymap::FixedBinding;
 use warpui::platform::Cursor;
 use warpui::text_layout::TextAlignment;
+use warpui::ui_components::components::UiComponent;
 use warpui::{
     AppContext, BlurContext, Element, Entity, EventContext, ModelHandle, SingletonEntity as _,
     TypedActionView, View, ViewContext, ViewHandle, WeakViewHandle, id,
@@ -1807,8 +1808,11 @@ impl FileTreeView {
         render_state: RenderState,
         appearance: &Appearance,
         item_highlight_state: ItemHighlightState,
+        is_hovered: bool,
         editor_view: Option<&ViewHandle<EditorView>>,
     ) -> Box<dyn Element> {
+        let tooltip_label = render_state.tooltip_label().to_string();
+        let name_clip_config = render_state.name_clip_config();
         // Create the folder header row
         let mut header_row = Flex::row()
             .with_main_axis_size(MainAxisSize::Max)
@@ -1903,6 +1907,7 @@ impl FileTreeView {
                             ITEM_FONT_SIZE,
                         )
                         .with_color(text_color)
+                        .with_clip(name_clip_config)
                         .with_style(text_style)
                         .finish(),
                     )
@@ -1924,8 +1929,27 @@ impl FileTreeView {
         if let Some(corner_radius) = item_highlight_state.corner_radius() {
             container = container.with_corner_radius(corner_radius);
         }
+        let item = container.finish();
+        if !is_hovered {
+            return item;
+        }
 
-        container.finish()
+        let tooltip = appearance
+            .ui_builder()
+            .tool_tip(tooltip_label)
+            .build()
+            .finish();
+        let mut stack = Stack::new().with_child(item);
+        stack.add_positioned_overlay_child(
+            tooltip,
+            OffsetPositioning::offset_from_parent(
+                Vector2F::new(0., 4.),
+                ParentOffsetBounds::WindowByPosition,
+                ParentAnchor::BottomLeft,
+                ChildAnchor::TopLeft,
+            ),
+        );
+        stack.finish()
     }
 
     fn is_item_expanded(&self, root_path: &StandardizedPath, item: &FileTreeItem) -> Option<bool> {
@@ -2011,6 +2035,7 @@ impl FileTreeView {
                 render_state,
                 appearance,
                 item_highlight_state,
+                mouse_state.is_hovered(),
                 editor_view,
             )
         })

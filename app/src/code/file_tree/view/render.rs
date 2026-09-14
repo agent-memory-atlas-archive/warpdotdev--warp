@@ -1,4 +1,5 @@
 use warpui::elements::{DraggableState, MouseStateHandle};
+use warpui::text_layout::ClipConfig;
 
 use super::FileTreeItem;
 use crate::appearance::Appearance;
@@ -72,3 +73,17 @@ pub(super) struct RenderState {
     pub draggable_state: DraggableState,
     pub is_ignored: bool,
 }
+
+impl RenderState {
+    pub fn name_clip_config(&self) -> ClipConfig {
+        ClipConfig::ellipsis()
+    }
+
+    pub fn tooltip_label(&self) -> &str {
+        &self.display_name
+    }
+}
+
+#[cfg(test)]
+#[path = "render_tests.rs"]
+mod tests;
