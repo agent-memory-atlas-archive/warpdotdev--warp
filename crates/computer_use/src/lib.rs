@@ -521,6 +521,9 @@ impl Drop for RecordingHandle {
     }
 }
 #[cfg(windows)]
+const ABANDONED_RECORDING_CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[cfg(windows)]
 fn spawn_windows_recording_cleanup(mut process: tokio::process::Child, path: PathBuf) {
     let result = std::thread::Builder::new()
         .name("recording-cleanup".to_string())
@@ -560,8 +563,33 @@ fn spawn_windows_recording_cleanup(mut process: tokio::process::Child, path: Pat
 }
 #[cfg(windows)]
 fn remove_abandoned_recording_files(path: &Path) {
-    let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(path.with_extension("log"));
+    let deadline = std::time::Instant::now() + ABANDONED_RECORDING_CLEANUP_TIMEOUT;
+    let mut pending = vec![path.to_path_buf(), path.with_extension("log")];
+    loop {
+        let mut failed = Vec::new();
+        for path in pending {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => failed.push((path, error)),
+            }
+        }
+        if failed.is_empty() {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            for (path, error) in failed {
+                log::warn!(
+                    "Failed to remove abandoned recording file {}: {}",
+                    path.display(),
+                    error
+                );
+            }
+            return;
+        }
+        pending = failed.into_iter().map(|(path, _)| path).collect();
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// The finalized output of a stopped recording. Carries the local file path and
