@@ -368,14 +368,15 @@ fn kernel_logs_contain_oom_for_pid(_: u32) -> bool {
 
 fn oom_kill_line_matches_pid(line: &str, pid: u32) -> bool {
     let pid = pid.to_string();
-    let killed_process = line
-        .match_indices("Killed process ")
-        .any(|(index, prefix)| {
-            let suffix = &line[index + prefix.len()..];
-            suffix
-                .strip_prefix(&pid)
-                .is_some_and(|suffix| suffix.starts_with(" ("))
-        });
+    let killed_process = (line.contains("Out of memory:") || line.contains("out of memory:"))
+        && line
+            .match_indices("Killed process ")
+            .any(|(index, prefix)| {
+                let suffix = &line[index + prefix.len()..];
+                suffix
+                    .strip_prefix(&pid)
+                    .is_some_and(|suffix| suffix.starts_with(" ("))
+            });
     if killed_process {
         return true;
     }
