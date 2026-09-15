@@ -4,7 +4,7 @@ use repo_metadata::file_tree_store::{FileTreeDirectoryEntryState, FileTreeEntryS
 use repo_metadata::{FileMetadata, FileTreeEntry};
 use warp_util::standardized_path::StandardizedPath;
 
-use super::sort_entries_for_file_tree;
+use super::{move_destination, sort_entries_for_file_tree};
 
 fn std_path(s: &str) -> StandardizedPath {
     StandardizedPath::try_new(s).expect("test path should be valid")
@@ -102,5 +102,32 @@ fn sort_entries_for_file_tree_uses_natural_order_for_numbered_files() {
             "/repo/L11.tsx",
             "/repo/L12.tsx",
         ]
+    );
+}
+
+#[test]
+fn move_destination_preserves_file_name() {
+    assert_eq!(
+        move_destination(&std_path("/repo/src/main.rs"), &std_path("/repo/tests")),
+        Some(std_path("/repo/tests/main.rs"))
+    );
+}
+
+#[test]
+fn move_destination_rejects_current_parent() {
+    assert_eq!(
+        move_destination(&std_path("/repo/src/main.rs"), &std_path("/repo/src")),
+        None
+    );
+}
+
+#[test]
+fn move_destination_rejects_item_and_descendants() {
+    let source = std_path("/repo/src");
+
+    assert_eq!(move_destination(&source, &source), None);
+    assert_eq!(
+        move_destination(&source, &std_path("/repo/src/nested")),
+        None
     );
 }

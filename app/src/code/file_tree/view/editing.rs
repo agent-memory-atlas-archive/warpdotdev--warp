@@ -72,6 +72,20 @@ pub(super) fn sort_entries_for_file_tree(
     }
 }
 
+pub(super) fn move_destination(
+    source: &StandardizedPath,
+    target_directory: &StandardizedPath,
+) -> Option<StandardizedPath> {
+    if source == target_directory
+        || target_directory.starts_with(source)
+        || source.parent().as_ref() == Some(target_directory)
+    {
+        return None;
+    }
+
+    Some(target_directory.join(source.file_name()?))
+}
+
 impl FileTreeView {
     /// Creates a new file below the directory at the given identifier.
     pub(super) fn create_new_file(&mut self, id: &FileTreeIdentifier, ctx: &mut ViewContext<Self>) {
@@ -214,34 +228,79 @@ impl FileTreeView {
                 let old_std_path = item.path().clone();
                 let mut new_std_path = old_std_path.clone();
                 new_std_path.set_file_name(&buffer_content);
-
-                let old_path = old_std_path.to_local_path_lossy();
-                let new_path = new_std_path.to_local_path_lossy();
-                if let Err(e) = std::fs::rename(&old_path, &new_path) {
-                    log::warn!(
-                        "Failed to rename {} -> {}: {e}",
-                        old_path.display(),
-                        new_path.display()
-                    );
-                    return;
-                }
-
-                // Update the in-memory model immediately so the UI reflects the change without delay.
-                if let Some(root_dir) = self.root_directories.get_mut(&file_tree_id.root) {
-                    root_dir.entry.rename_path(&old_std_path, &new_std_path);
-                }
-
-                // Emit event to notify workspace that a file was renamed
-                ctx.emit(FileTreeEvent::FileRenamed {
-                    old_path: old_path.clone(),
-                    new_path: new_path.clone(),
-                });
-
-                // Rebuild and select the renamed item using its FileTreeIdentifier
-                self.rebuild_flatten_items_impl(Some(&file_tree_id), None, None);
-                ctx.notify();
+                self.move_item(&file_tree_id, old_std_path, new_std_path, ctx);
             }
         }
+    }
+
+    pub(super) fn move_item_to_directory(
+        &mut self,
+        id: &FileTreeIdentifier,
+        target_directory: &StandardizedPath,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(root_dir) = self.root_directories.get(&id.root) else {
+            return;
+        };
+        if !matches!(
+            root_dir.entry.get(target_directory),
+            Some(FileTreeEntryState::Directory(_))
+        ) {
+            return;
+        }
+        let Some(source) = root_dir.items.get(id.index).map(|item| item.path().clone()) else {
+            return;
+        };
+        let Some(destination) = move_destination(&source, target_directory) else {
+            return;
+        };
+        if destination.to_local_path_lossy().exists() {
+            return;
+        }
+
+        self.move_item(id, source, destination, ctx);
+    }
+
+    fn move_item(
+        &mut self,
+        id: &FileTreeIdentifier,
+        old_std_path: StandardizedPath,
+        new_std_path: StandardizedPath,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(repository_root) = self
+            .root_directories
+            .get(&id.root)
+            .map(|root_dir| root_dir.entry.root_directory().as_ref().clone())
+        else {
+            return;
+        };
+        let old_path = old_std_path.to_local_path_lossy();
+        let new_path = new_std_path.to_local_path_lossy();
+        if let Err(e) = std::fs::rename(&old_path, &new_path) {
+            log::warn!(
+                "Failed to move {} -> {}: {e}",
+                old_path.display(),
+                new_path.display()
+            );
+            return;
+        }
+        #[cfg(feature = "local_fs")]
+        self.repository_metadata_model.update(ctx, |model, ctx| {
+            model.rename_local_entry_path(&repository_root, &old_std_path, &new_std_path, ctx);
+        });
+
+        if let Some(root_dir) = self.root_directories.get_mut(&id.root) {
+            root_dir.entry.rename_path(&old_std_path, &new_std_path);
+        }
+
+        ctx.emit(FileTreeEvent::FileRenamed {
+            old_path: old_path.clone(),
+            new_path: new_path.clone(),
+        });
+
+        self.rebuild_flatten_items_impl(Some(id), None, None);
+        ctx.notify();
     }
 
     /// Cancels a pending edit and discards any changes.
