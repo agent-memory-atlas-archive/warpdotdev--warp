@@ -38,6 +38,8 @@ use warp_errors::{ErrorExt, register_error, report_error, report_if_error};
 use warp_graphql::ai::{AgentTaskState, PlatformErrorCode};
 use warp_managed_secrets::ManagedSecretValue;
 use warp_util::local_or_remote_path::LocalOrRemotePath;
+#[cfg(unix)]
+use warpui::r#async::executor::Background;
 use warpui::r#async::{FutureExt, TimeoutError, Timer};
 use warpui::{AppContext, Entity, ModelContext, ModelHandle, ModelSpawner, SingletonEntity};
 
@@ -941,37 +943,34 @@ const fn should_attempt_handoff_snapshot(
 #[cfg(unix)]
 struct InterruptWatch {
     sig_ids: Vec<signal_hook::SigId>,
-    closed: Arc<std::sync::atomic::AtomicBool>,
-    waiter: thread::JoinHandle<()>,
+    abort: tokio::task::AbortHandle,
 }
 
 #[cfg(unix)]
 impl InterruptWatch {
     fn unregister(self) {
-        use std::sync::atomic::Ordering;
-
-        self.closed.store(true, Ordering::SeqCst);
+        self.abort.abort();
         for id in self.sig_ids {
             signal_hook::low_level::unregister(id);
         }
-        let _ = self.waiter.join();
     }
 }
 
 #[cfg(unix)]
-fn watch_interrupt_signals() -> Option<(
+fn watch_interrupt_signals(
+    background: &Background,
+) -> Option<(
     impl Future<Output = InterruptSignal>,
     InterruptFlags,
     InterruptWatch,
 )> {
-    use std::os::unix::net::UnixStream;
     use std::sync::atomic::AtomicBool;
 
+    use futures::StreamExt as _;
     use signal_hook::flag;
-    use signal_hook::low_level::pipe;
+    use signal_hook_tokio::Signals;
 
     let shutdown_armed = Arc::new(AtomicBool::new(false));
-    let closed = Arc::new(AtomicBool::new(false));
     let flags = InterruptFlags {
         term: Arc::new(AtomicBool::new(false)),
         int: Arc::new(AtomicBool::new(false)),
@@ -995,90 +994,31 @@ fn watch_interrupt_signals() -> Option<(
         }
     }
 
-    let Ok((read, write)) = UnixStream::pair() else {
-        for id in sig_ids {
-            signal_hook::low_level::unregister(id);
+    let wait_flags = flags.clone();
+    let join = background.spawn_future(async move {
+        let mut signals =
+            match Signals::new([signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT]) {
+                Ok(signals) => signals,
+                Err(_) => return future::pending().await,
+            };
+        loop {
+            if let Some(signal) = wait_flags.pending() {
+                return signal;
+            }
+            match signals.next().await {
+                Some(_) => {}
+                None => future::pending::<()>().await,
+            }
         }
-        return None;
-    };
-    let Ok(write_term) = write.try_clone() else {
-        for id in sig_ids {
-            signal_hook::low_level::unregister(id);
-        }
-        return None;
-    };
-    let Ok(term_pipe) = pipe::register(signal_hook::consts::SIGTERM, write_term) else {
-        for id in sig_ids {
-            signal_hook::low_level::unregister(id);
-        }
-        return None;
-    };
-    sig_ids.push(term_pipe);
-    let Ok(int_pipe) = pipe::register(signal_hook::consts::SIGINT, write) else {
-        for id in sig_ids {
-            signal_hook::low_level::unregister(id);
-        }
-        return None;
-    };
-    sig_ids.push(int_pipe);
-
-    let (tx, rx) = oneshot::channel();
-    let waiter = spawn_pipe_interrupt_waiter(read, flags.clone(), tx, Arc::clone(&closed));
+    });
+    let abort = join.abort_handle();
     let fut = async move {
-        match rx.await {
+        match join.await {
             Ok(signal) => signal,
             Err(_) => future::pending().await,
         }
     };
-    Some((
-        fut,
-        flags,
-        InterruptWatch {
-            sig_ids,
-            closed,
-            waiter,
-        },
-    ))
-}
-
-#[cfg(unix)]
-fn spawn_pipe_interrupt_waiter(
-    mut read: std::os::unix::net::UnixStream,
-    flags: InterruptFlags,
-    tx: oneshot::Sender<InterruptSignal>,
-    closed: Arc<std::sync::atomic::AtomicBool>,
-) -> thread::JoinHandle<()> {
-    use std::io::Read as _;
-    use std::sync::atomic::Ordering;
-
-    thread::spawn(move || {
-        let mut buf = [0u8; 8];
-        loop {
-            if closed.load(Ordering::SeqCst) {
-                return;
-            }
-            if let Some(signal) = flags.pending() {
-                let _ = tx.send(signal);
-                return;
-            }
-            match read.read(&mut buf) {
-                Ok(0) => {
-                    if let Some(signal) = flags.pending() {
-                        let _ = tx.send(signal);
-                    }
-                    return;
-                }
-                Ok(_) => {}
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
-                Err(_) => {
-                    if let Some(signal) = flags.pending() {
-                        let _ = tx.send(signal);
-                    }
-                    return;
-                }
-            }
-        }
-    })
+    Some((fut, flags, InterruptWatch { sig_ids, abort }))
 }
 
 #[cfg(unix)]
@@ -1436,6 +1376,8 @@ impl AgentDriver {
         let foreground_for_error = foreground.clone();
         let server_api = ServerApiProvider::as_ref(ctx).get_ai_client();
         let task_id = self.task_id;
+        #[cfg(unix)]
+        let background = ctx.background_executor();
 
         ctx.spawn(
             async move {
@@ -1532,15 +1474,17 @@ impl AgentDriver {
                         .unwrap_or_else(|| Either::Right(future::pending::<()>()));
 
                     #[cfg(unix)]
-                    let (signal, interrupt_flags, interrupt_watch) = match watch_interrupt_signals()
-                    {
-                        Some((fut, flags, watch)) => (Either::Left(fut), Some(flags), Some(watch)),
-                        None => (
-                            Either::Right(future::pending::<InterruptSignal>()),
-                            None,
-                            None,
-                        ),
-                    };
+                    let (signal, interrupt_flags, interrupt_watch) =
+                        match watch_interrupt_signals(&background) {
+                            Some((fut, flags, watch)) => {
+                                (Either::Left(fut), Some(flags), Some(watch))
+                            }
+                            None => (
+                                Either::Right(future::pending::<InterruptSignal>()),
+                                None,
+                                None,
+                            ),
+                        };
                     let run = Self::run_internal(task, foreground.clone()).fuse();
                     let timer = timer_fut.fuse();
                     #[cfg(unix)]

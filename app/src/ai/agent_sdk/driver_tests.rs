@@ -2781,7 +2781,9 @@ fn signal_lifecycle_child() -> ! {
     };
     let ready_path = std::env::var(SIGNAL_READY_ENV).unwrap();
 
-    let (signal_fut, flags, _watch) = super::watch_interrupt_signals().expect("signal watch");
+    let background = warpui::r#async::executor::Background::default();
+    let (signal_fut, flags, _watch) =
+        super::watch_interrupt_signals(&background).expect("signal watch");
     fs::write(&ready_path, b"ready").unwrap();
 
     let signal = block_on(signal_fut);
