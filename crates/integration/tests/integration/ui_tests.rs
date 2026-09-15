@@ -124,6 +124,10 @@ integration_tests! {
     test_with_launch_config_with_active_tab_index,
     test_with_launch_config_with_active_pane,
     test_with_launch_config_with_no_active_pane,
+    test_launch_config_restores_tab_groups,
+    test_launch_config_restores_tab_groups_into_active_window,
+    test_launch_config_restores_pinned_tab_group_into_pinned_prefix,
+    test_launch_config_restore_keeps_existing_group_contiguous,
     test_find_query_not_evaluated_on_terminal_mode_change,
     test_custom_open_completions_menu_binding,
     test_ssh_with_shell_override,
@@ -362,6 +366,7 @@ integration_tests! {
 
     // AI document tests
     test_copy_ai_document_as_markdown_from_overflow_menu,
+    test_restored_ai_document_populates_code_block_after_first_layout,
 
     // Keyboard protocol tests
     test_keyboard_protocol_disabled_shift_enter,

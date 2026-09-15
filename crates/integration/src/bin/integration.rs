@@ -72,7 +72,6 @@ pub fn main() -> Result<()> {
                 warp::terminal::local_tty::run_terminal_server(args);
                 return Ok(());
             }
-            // This is a catch-all to handle the plugin host, which the integration test crate doesn't have a feature flag for.
             #[allow(unreachable_patterns)]
             other => panic!("Worker not supported in integration tests: {other:?}"),
         }
@@ -203,6 +202,7 @@ fn register_tests() -> HashMap<&'static str, BoxedBuilderFn> {
     register_test!(test_alias_guards_on_ps1_set);
     register_test!(test_ps1_value_not_null_or_exit);
     register_test!(test_custom_ps1_expansion_bash);
+    register_test!(test_bash_honor_ps1_expands_dynamic_prompt_once);
     register_test!(test_completions_with_autocd);
     register_test!(test_auto_title);
     register_test!(test_warp_auto_title_disabled);
@@ -260,6 +260,10 @@ fn register_tests() -> HashMap<&'static str, BoxedBuilderFn> {
     register_test!(test_with_launch_config_with_active_tab_index);
     register_test!(test_with_launch_config_with_active_pane);
     register_test!(test_with_launch_config_with_no_active_pane);
+    register_test!(test_launch_config_restores_tab_groups);
+    register_test!(test_launch_config_restores_tab_groups_into_active_window);
+    register_test!(test_launch_config_restores_pinned_tab_group_into_pinned_prefix);
+    register_test!(test_launch_config_restore_keeps_existing_group_contiguous);
     register_test!(test_find_query_not_evaluated_on_terminal_mode_change);
     register_test!(test_bash_bootstraps_with_prompt_command_array);
     register_test!(test_bash_bootstraps_with_prompt_command_array_that_sets_ps1);
@@ -496,6 +500,7 @@ fn register_tests() -> HashMap<&'static str, BoxedBuilderFn> {
 
     // AI document tests
     register_test!(test_copy_ai_document_as_markdown_from_overflow_menu);
+    register_test!(test_restored_ai_document_populates_code_block_after_first_layout);
 
     // Keyboard protocol tests
     register_test!(test_keyboard_protocol_disabled_shift_enter);
