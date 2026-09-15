@@ -259,8 +259,8 @@ fn parse_namespace_cloud_command(command: &str) -> Option<InteractiveSshCommand>
                     return None;
                 }
             }
-            arg if arg.starts_with("--disable-pty=") => {
-                let value = arg.strip_prefix("--disable-pty=")?;
+            arg if arg.starts_with("--disable-pty=") || arg.starts_with("-T=") => {
+                let (_, value) = arg.split_once('=')?;
                 match value {
                     "1" | "t" | "T" | "TRUE" | "true" | "True" => return None,
                     "0" | "f" | "F" | "FALSE" | "false" | "False" => {}

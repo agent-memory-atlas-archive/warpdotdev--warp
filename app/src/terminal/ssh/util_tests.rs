@@ -95,6 +95,9 @@ fn ssh_namespace_cloud_parsing() {
     assert!(parse_interactive_ssh_command("nsc ssh --disable-pty=true 85a32emcg99ii").is_none());
     assert!(parse_interactive_ssh_command("nsc ssh --disable-pty=1 85a32emcg99ii").is_none());
     assert!(parse_interactive_ssh_command("nsc ssh --disable-pty=false 85a32emcg99ii").is_some());
+    assert!(parse_interactive_ssh_command("nsc ssh -T=true 85a32emcg99ii").is_none());
+    assert!(parse_interactive_ssh_command("nsc ssh -T=false 85a32emcg99ii").is_some());
+    assert!(parse_interactive_ssh_command("nsc ssh -T=invalid 85a32emcg99ii").is_none());
     assert!(parse_interactive_ssh_command("nsc ssh 85a32emcg99ii ls /").is_none());
     assert!(parse_interactive_ssh_command("nsc ssh --container_name").is_none());
     assert!(parse_interactive_ssh_command("nsc ssh --container_name --oneshot").is_none());
