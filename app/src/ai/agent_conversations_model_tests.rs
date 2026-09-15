@@ -1038,6 +1038,67 @@ fn rtc_task_refresh_deduplicates_tasks_in_trailing_flush() {
 }
 
 #[test]
+fn rtc_task_refresh_requeues_after_skipped_trailing_fetch() {
+    let task = create_test_task(&make_uuid(9805), "user-a", Utc::now());
+    let task_id = task.task_id;
+    let request = {
+        let mut server = warp_core::channel::ChannelState::mock_server();
+        server
+            .mock("GET", format!("/api/v1/agent/runs/{task_id}").as_str())
+            .with_status(200)
+            .with_body(serde_json::to_string(&task).unwrap())
+            .expect(1)
+            .create()
+    };
+
+    App::test((), |mut app| async move {
+        let leading_task_id = make_uuid(9806).parse().unwrap();
+        app.add_singleton_model(|_| ServerApiProvider::new_for_test());
+        app.read(|ctx| {
+            ServerApiProvider::as_ref(ctx)
+                .get()
+                .set_ambient_workload_token_for_test("test-workload-token".to_string(), None);
+        });
+        let model = app.add_singleton_model(|_| {
+            let mut model = create_test_model();
+            model
+                .task_fetch_state
+                .insert(leading_task_id, TaskFetchState::InFlight);
+            model
+                .task_fetch_state
+                .insert(task_id, TaskFetchState::InFlight);
+            model
+        });
+        let task_updates = subscribe_to_tasks_updated(&mut app, &model);
+
+        model.update(&mut app, |model, ctx| {
+            model.handle_rtc_for_list_views(leading_task_id, ctx);
+            model.handle_rtc_for_list_views(task_id, ctx);
+        });
+        assert_no_task_update(
+            &task_updates,
+            super::RTC_TASK_REFRESH_THROTTLE + StdDuration::from_secs(1),
+        )
+        .await;
+
+        model.update(&mut app, |model, ctx| {
+            model.task_fetch_state.remove(&task_id);
+            model.handle_rtc_for_list_views(task_id, ctx);
+        });
+        wait_for_task_update(
+            &task_updates,
+            super::RTC_TASK_REFRESH_THROTTLE + StdDuration::from_secs(1),
+        )
+        .await;
+
+        model.update(&mut app, |model, _| {
+            model.abort_rtc_task_refresh_throttle();
+        });
+        request.assert();
+    });
+}
+
+#[test]
 fn rtc_task_refresh_reset_aborts_timer_and_discards_pending_tasks() {
     let pending_task = create_test_task(&make_uuid(9804), "user-a", Utc::now());
     let pending_task_id = pending_task.task_id;

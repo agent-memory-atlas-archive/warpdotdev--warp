@@ -888,7 +888,7 @@ impl AgentConversationsModel {
                     for task_id in &pending_task_ids {
                         model.async_fetch_task(task_id, ctx);
                     }
-                    model.start_rtc_task_refresh_throttle_timer(pending_task_ids, ctx);
+                    model.start_rtc_task_refresh_throttle_timer(HashSet::new(), ctx);
                 }
             },
         );
