@@ -546,6 +546,7 @@ use crate::workspace::view::cloud_agent_capacity_modal::CloudAgentCapacityModalV
 use crate::workspace::{
     CommandSearchOptions, ForkAIConversationParams, ForkFromExchange,
     ForkedConversationDestination, OneTimeModalModel, ToastStack, WorkspaceAction,
+    WorkspaceRegistry,
 };
 use crate::workspaces::user_workspaces::{UserWorkspaces, UserWorkspacesEvent};
 use crate::workspaces::workspace::CustomerType;
@@ -5468,6 +5469,14 @@ impl TerminalView {
                 && let Some(reason) = self.finish_reason_for_conversation(*conversation_id, ctx)
             {
                 self.drain_queued_prompts(*conversation_id, reason, ctx);
+            } else if QueuedQueryModel::as_ref(ctx).has_queue(*conversation_id) {
+                log::info!(
+                    "event=turn_drain_deferred terminal_id={:?} conversation_id={conversation_id} active_subagent={has_active_subagent} has_finished_block={} queue_len={}",
+                    self.view_id,
+                    self.finish_reason_for_conversation(*conversation_id, ctx)
+                        .is_some(),
+                    QueuedQueryModel::as_ref(ctx).queue(*conversation_id).len(),
+                );
             }
 
             // If the most recent action in the current interaction turn created or updated a plan
@@ -5540,6 +5549,7 @@ impl TerminalView {
         let id = QueuedQueryModel::handle(ctx).update(ctx, |model, ctx| {
             model.append(conversation_id, QueuedQuery::new(prompt, origin), ctx)
         });
+        self.maybe_dispatch_steering_prompt_now(conversation_id, ctx);
         Some(id)
     }
 
@@ -5574,6 +5584,7 @@ impl TerminalView {
                     ctx,
                 );
             });
+            self.maybe_dispatch_steering_prompt_now(conversation_id, ctx);
         } else {
             self.send_user_query_after_next_conversation_finished(
                 prompt, /* show_close_button */ true, /* show_send_now_button */ false,
@@ -5582,9 +5593,33 @@ impl TerminalView {
         }
     }
 
+    /// If `conversation_id`'s queue is in `Steering` mode and nothing is currently streaming for
+    /// it, attempts to dispatch the just-queued row immediately rather than waiting for a future
+    /// turn-completion event that may never come (e.g. the conversation has nothing else in
+    /// flight right now). No-ops when a stream is already active for the conversation --
+    /// `Steering`'s piggyback-on-next-request and idle-drain mechanisms pick the row up once
+    /// that stream's turn produces a natural boundary, so firing here too would interrupt it.
+    fn maybe_dispatch_steering_prompt_now(
+        &mut self,
+        conversation_id: AIConversationId,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if !QueuedQueryModel::as_ref(ctx).is_steering(conversation_id) {
+            return;
+        }
+        if self
+            .ai_controller
+            .as_ref(ctx)
+            .has_active_stream_for_conversation(conversation_id, ctx)
+        {
+            return;
+        }
+        self.drain_queued_prompts(conversation_id, FinishReason::Complete, ctx);
+    }
+
     /// Drains one prompt from the queued-query singleton for `conversation_id` when that
     /// conversation finishes.
-    fn drain_queued_prompts(
+    pub(crate) fn drain_queued_prompts(
         &mut self,
         conversation_id: AIConversationId,
         finish_reason: FinishReason,
@@ -5596,6 +5631,9 @@ impl TerminalView {
                 let first_row_is_in_edit_mode =
                     QueuedQueryModel::as_ref(ctx).first_row_is_in_edit_mode(conversation_id);
                 if first_row_is_in_edit_mode && !input_is_empty {
+                    log::info!(
+                        "event=turn_drain_deferred conversation_id={conversation_id} reason=editing_head_with_local_draft",
+                    );
                     return;
                 }
 
@@ -5604,6 +5642,27 @@ impl TerminalView {
                 let action = QueuedQueryModel::as_ref(ctx).peek_autofire(conversation_id);
                 match action {
                     Some(AutofireAction::Submit { query_id, text }) => {
+                        if QueuedQueryModel::as_ref(ctx)
+                            .queue(conversation_id)
+                            .iter()
+                            .any(|row| {
+                                row.id() == query_id && row.shared_session_prompt().is_some()
+                            })
+                        {
+                            // Shared-session injections are normally dispatched via `Steering`'s
+                            // piggyback-on-next-request mechanism, or immediately when queued
+                            // while idle; reaching one here means neither applied (e.g. a prior
+                            // dispatch was deferred because a CLI subagent was active), so try
+                            // dispatching the head row now that this turn finished.
+                            self.ai_controller.update(ctx, |controller, ctx| {
+                                controller.dispatch_queued_warp_agent_prompt(
+                                    conversation_id,
+                                    None,
+                                    ctx,
+                                );
+                            });
+                            return;
+                        }
                         self.input.update(ctx, |input, ctx| {
                             input.submit_queued_prompt_for_active_pane(
                                 text,
@@ -6121,6 +6180,149 @@ impl TerminalView {
         }
         self.remove_cloud_mode_queue_row(ctx);
     }
+
+    fn ai_block_targets_for_history_event(
+        &self,
+        event: &BlocklistAIHistoryEvent,
+        ctx: &AppContext,
+    ) -> Vec<ViewHandle<AIBlock>> {
+        match event {
+            BlocklistAIHistoryEvent::AppendedExchange {
+                conversation_id, ..
+            } => {
+                // The pane's latest block and the conversation's latest block may each lose
+                // latest-only controls when a new exchange starts.
+                let mut targets = Vec::with_capacity(2);
+                if let Some(handle) =
+                    self.rich_content_views
+                        .iter()
+                        .rev()
+                        .find_map(|rich_content| {
+                            rich_content
+                                .ai_block_metadata()
+                                .map(|metadata| metadata.ai_block_handle.clone())
+                        })
+                {
+                    targets.push(handle);
+                }
+                if let Some(handle) =
+                    self.rich_content_views
+                        .iter()
+                        .rev()
+                        .find_map(|rich_content| {
+                            let metadata = rich_content.ai_block_metadata()?;
+                            (metadata.conversation_id == *conversation_id)
+                                .then(|| metadata.ai_block_handle.clone())
+                        })
+                    && targets.iter().all(|target| target.id() != handle.id())
+                {
+                    targets.push(handle);
+                }
+                targets
+            }
+            BlocklistAIHistoryEvent::UpdatedStreamingExchange { exchange_id, .. } => {
+                // Only the matching block that began live can consume output updates; completed
+                // restored blocks receive replay-only events.
+                self.ai_block_for_exchange(exchange_id)
+                    .filter(|handle| handle.as_ref(ctx).receives_live_output_updates())
+                    .cloned()
+                    .into_iter()
+                    .collect()
+            }
+            BlocklistAIHistoryEvent::UpdatedTodoList {
+                conversation_id, ..
+            } => {
+                // Todo state can appear in earlier exchanges, so every todo-bearing block in the
+                // conversation must refresh.
+                self.rich_content_views
+                    .iter()
+                    .filter_map(|rich_content| {
+                        let metadata = rich_content.ai_block_metadata()?;
+                        (metadata.conversation_id == *conversation_id
+                            && metadata.ai_block_handle.as_ref(ctx).contains_todo_list())
+                        .then(|| metadata.ai_block_handle.clone())
+                    })
+                    .collect()
+            }
+            BlocklistAIHistoryEvent::ConversationUsageMetadataUpdated { conversation_id } => {
+                // The conversation's latest usage pill and each ancestor's latest rollup depend on
+                // this metadata.
+                let history = BlocklistAIHistoryModel::as_ref(ctx);
+                let mut affected_conversation_ids = HashSet::from([*conversation_id]);
+                let mut current_conversation_id = *conversation_id;
+                while let Some(parent_conversation_id) = history
+                    .conversation(&current_conversation_id)
+                    .and_then(|conversation| {
+                        history.resolved_parent_conversation_id_for_conversation(conversation)
+                    })
+                {
+                    if !affected_conversation_ids.insert(parent_conversation_id) {
+                        break;
+                    }
+                    current_conversation_id = parent_conversation_id;
+                }
+                let latest_exchange_ids = affected_conversation_ids
+                    .into_iter()
+                    .filter_map(|conversation_id| {
+                        history
+                            .conversation(&conversation_id)
+                            .and_then(|conversation| conversation.latest_visible_exchange())
+                            .map(|exchange| exchange.id)
+                    })
+                    .collect::<HashSet<_>>();
+
+                self.rich_content_views
+                    .iter()
+                    .filter_map(|rich_content| {
+                        let metadata = rich_content.ai_block_metadata()?;
+                        latest_exchange_ids
+                            .contains(&metadata.exchange_id)
+                            .then(|| metadata.ai_block_handle.clone())
+                    })
+                    .collect()
+            }
+            BlocklistAIHistoryEvent::StartedNewConversation { .. }
+            | BlocklistAIHistoryEvent::CreatedSubtask { .. }
+            | BlocklistAIHistoryEvent::UpgradedTask { .. }
+            | BlocklistAIHistoryEvent::ReassignedExchange { .. }
+            | BlocklistAIHistoryEvent::UpdatedConversationStatus { .. }
+            | BlocklistAIHistoryEvent::SetActiveConversation { .. }
+            | BlocklistAIHistoryEvent::ClearedActiveConversation { .. }
+            | BlocklistAIHistoryEvent::ClearedConversationsForTerminalSurface { .. }
+            | BlocklistAIHistoryEvent::UpdatedAutoexecuteOverride { .. }
+            | BlocklistAIHistoryEvent::SplitConversation { .. }
+            | BlocklistAIHistoryEvent::RemoveConversation { .. }
+            | BlocklistAIHistoryEvent::DeletedConversation { .. }
+            | BlocklistAIHistoryEvent::RestoredConversations { .. }
+            | BlocklistAIHistoryEvent::UpdatedConversationMetadata { .. }
+            | BlocklistAIHistoryEvent::UpdatedConversationTitle { .. }
+            | BlocklistAIHistoryEvent::UpdatedConversationArtifacts { .. }
+            | BlocklistAIHistoryEvent::ConversationServerTokenAssigned { .. }
+            | BlocklistAIHistoryEvent::ConversationTransferredBetweenTerminalSurfaces { .. }
+            | BlocklistAIHistoryEvent::NewConversationRequestComplete { .. }
+            | BlocklistAIHistoryEvent::OrchestrationConfigUpdated { .. }
+            | BlocklistAIHistoryEvent::LocalSharedSessionEstablished { .. } => Vec::new(),
+        }
+    }
+
+    fn route_ai_block_history_event(
+        &self,
+        event: &BlocklistAIHistoryEvent,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        for ai_block in self.ai_block_targets_for_history_event(event, ctx) {
+            ai_block.update(ctx, |block, ctx| {
+                if matches!(
+                    event,
+                    BlocklistAIHistoryEvent::UpdatedStreamingExchange { .. }
+                ) {
+                    block.handle_history_output_update(ctx);
+                } else {
+                    ctx.notify();
+                }
+            });
+        }
+    }
     fn render_owner_for_ai_history_event(
         &self,
         history_model: &BlocklistAIHistoryModel,
@@ -6186,6 +6388,7 @@ impl TerminalView {
         if !should_handle {
             return;
         }
+        self.route_ai_block_history_event(event, ctx);
         // If the conversation details panel is open and showing an active local
         // AI conversation in this terminal view, refresh its data when status,
         // artifacts, exchanges, or metadata change. Mirrors the WASM transcript
@@ -8893,6 +9096,24 @@ impl TerminalView {
                     ctx,
                 );
             });
+        }
+    }
+
+    /// Handles a shared-session cancel control action (a viewer's stop or a server-side steering
+    /// interrupt) for the live conversation bound to `server_conversation_token`. The conversation
+    /// is stopped the same way a local stop is, so an in-flight agent command is interrupted along
+    /// with the turn rather than left running to completion.
+    #[cfg(feature = "local_tty")]
+    pub(crate) fn handle_shared_session_cancel_action(
+        &mut self,
+        server_conversation_token: SessionSharingServerConversationToken,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let conversation_id = self.ai_controller.update(ctx, |controller, ctx| {
+            controller.conversation_for_shared_session_cancel_action(server_conversation_token, ctx)
+        });
+        if let Some(conversation_id) = conversation_id {
+            self.stop_local_agent_conversation(conversation_id, ctx);
         }
     }
 
@@ -12165,7 +12386,17 @@ impl TerminalView {
                 // case, we want the block to be focused because otherwise,
                 // users get stuck as they'd otherwise need to click into the
                 // box to respond to whether or not they want to update oh my zsh.
-                self.focus_terminal(ctx);
+                //
+                // Skipped while a tab or tab-group rename editor is focused. Taking focus
+                // would end the rename and lose user inputs (#14241).
+                let inline_rename_editor_is_focused = WorkspaceRegistry::as_ref(ctx)
+                    .get(self.window_id, ctx)
+                    .is_some_and(|workspace| {
+                        workspace.as_ref(ctx).is_inline_rename_editor_focused(ctx)
+                    });
+                if !inline_rename_editor_is_focused {
+                    self.focus_terminal(ctx);
+                }
             }
             ModelEvent::AfterBlockStarted {
                 command,

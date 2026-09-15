@@ -26,7 +26,7 @@ use repo_metadata::{RepoMetadataModel, RepositoryIdentifier};
 use session_sharing_protocol::sharer::SessionRetentionReason;
 use tracing::Instrument as _;
 use uuid::Uuid;
-use warp_cli::agent::{Harness, OutputFormat, RepositoryHeadOverride};
+use warp_cli::agent::{Harness, OutputFormat, RepositoryPreparationOverride};
 use warp_cli::mcp::MCPSpec;
 use warp_cli::share::ShareRequest;
 use warp_cli::skill::SkillSpec;
@@ -64,6 +64,7 @@ use crate::ai::ambient_agents::{
 };
 use crate::ai::bedrock_credentials;
 use crate::ai::blocklist::agent_view::AgentViewEntryOrigin;
+use crate::ai::blocklist::block::FinishReason;
 use crate::ai::blocklist::local_agent_task_sync_model::LocalAgentTaskSyncModel;
 use crate::ai::blocklist::orchestration_event_streamer::{
     register_agent_event_consumer, unregister_agent_event_consumer,
@@ -72,7 +73,7 @@ use crate::ai::blocklist::orchestration_events::OrchestrationEventService;
 use crate::ai::blocklist::pending_cli_harness_prompt_queue::PendingCliHarnessPromptQueue;
 use crate::ai::blocklist::{
     BlocklistAIHistoryEvent, BlocklistAIHistoryModel, ConversationStatusUpdate, FinalizeReason,
-    finalize_recording_for_conversation,
+    QueuedQueryEvent, QueuedQueryModel, finalize_recording_for_conversation,
 };
 use crate::ai::cloud_environments::{
     AmbientAgentEnvironment, CloudAmbientAgentEnvironment, GithubRepo, SourceRepo,
@@ -606,8 +607,8 @@ pub struct AgentDriverOptions {
     /// Additional per-task repositories supplied by the server, such as a webhook's
     /// originating repository. Empty for local runs.
     pub additional_source_repos: Vec<SourceRepo>,
-    /// Overrides for repository HEADs in the agent's session.
-    pub repository_head_overrides: Vec<RepositoryHeadOverride>,
+    /// Server-owned repository preparation overrides for the agent's session.
+    pub repository_preparation_overrides: Vec<RepositoryPreparationOverride>,
     /// Whether origin remotes should be removed from environment repositories.
     pub remove_repository_origins: bool,
     /// Selected execution harness for this run.
@@ -699,7 +700,7 @@ pub struct AgentDriver {
     environment: Option<AmbientAgentEnvironment>,
     /// Additional per-task repositories supplied by the server.
     additional_source_repos: Vec<SourceRepo>,
-    repository_head_overrides: Vec<RepositoryHeadOverride>,
+    repository_preparation_overrides: Vec<RepositoryPreparationOverride>,
     remove_repository_origins: bool,
 
     // End-of-run snapshot upload controls.
@@ -877,8 +878,8 @@ pub enum AgentDriverError {
          Check the setup commands for this environment."
     )]
     SetupCommandExitedShell { command: String },
-    #[error("Timed out refreshing team metadata")]
-    TeamMetadataRefreshTimeout,
+    #[error("Failed to refresh team metadata")]
+    TeamMetadataRefreshFailed(#[source] anyhow::Error),
     #[error("{0}")]
     SkillResolutionFailed(String),
     #[error("Failed to fetch git credentials")]
@@ -988,6 +989,26 @@ const fn sandbox_deadline_message(on_free_plan: bool) -> &'static str {
     }
 }
 
+/// Environment variable holding the Unix timestamp (seconds) at which the sandbox
+/// hosting this run will be hard-killed.
+const SANDBOX_DEADLINE_ENV: &str = "WARP_SANDBOX_DEADLINE";
+
+/// Returns the instant at which the sandbox hosting this run will be hard-killed.
+///
+/// `None` outside a Warp-hosted sandbox, since the server only injects a deadline for
+/// Docker Sandbox and Namespace runs. Local and self-hosted runs have no bounded lifetime
+/// to report.
+pub(crate) fn sandbox_deadline() -> Option<SystemTime> {
+    let deadline_unix = std::env::var(SANDBOX_DEADLINE_ENV)
+        .ok()?
+        .parse::<i64>()
+        .ok()?;
+    if deadline_unix <= 0 {
+        return None;
+    }
+    SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(deadline_unix as u64))
+}
+
 impl ErrorExt for AgentDriverError {
     fn is_actionable(&self) -> bool {
         error_classification::classify_driver_error(self).0 == AgentTaskState::Error
@@ -1034,7 +1055,7 @@ impl AgentDriver {
             cloud_providers,
             environment,
             additional_source_repos,
-            repository_head_overrides,
+            repository_preparation_overrides,
             remove_repository_origins,
             selected_harness,
             third_party_harness_model_config,
@@ -1127,6 +1148,19 @@ impl AgentDriver {
             ctx,
         )?;
 
+        // Sharing starts asynchronously from terminal creation, before run_internal's setup waits.
+        log::info!(
+            "event=driver_queue_configuration task_id={task_id:?} harness={selected_harness} sharing_requested={should_share} native_queue_enabled={}",
+            selected_harness == Harness::Oz && (should_share || task_id.is_some()),
+        );
+        if selected_harness == Harness::Oz && (should_share || task_id.is_some()) {
+            let terminal = terminal_driver.as_ref(ctx).terminal_view().clone();
+            terminal.update(ctx, |terminal, ctx| {
+                terminal.ai_controller().update(ctx, |controller, ctx| {
+                    controller.bind_native_prompt_conversation(restored_conversation_id, ctx);
+                });
+            });
+        }
         // Subscribe to TerminalDriver events for task-specific handling.
         ctx.subscribe_to_model(&terminal_driver, |me, _, event, ctx| {
             me.handle_terminal_driver_event(event, ctx);
@@ -1206,7 +1240,7 @@ impl AgentDriver {
             cloud_providers,
             environment,
             additional_source_repos,
-            repository_head_overrides,
+            repository_preparation_overrides,
             remove_repository_origins,
             snapshot_disabled: snapshot_disabled_value,
             snapshot_upload_timeout: snapshot_upload_timeout
@@ -1258,7 +1292,7 @@ impl AgentDriver {
             cloud_providers: Vec::new(),
             environment: None,
             additional_source_repos: Vec::new(),
-            repository_head_overrides: Vec::new(),
+            repository_preparation_overrides: Vec::new(),
             remove_repository_origins: false,
             snapshot_disabled: false,
             snapshot_upload_timeout: snapshot::DEFAULT_SNAPSHOT_UPLOAD_TIMEOUT,
@@ -1277,6 +1311,12 @@ impl AgentDriver {
     /// Pair to the registration in `new` / `execute_run`. No-op when
     /// nothing was registered.
     fn unregister_streamer_consumer(&self, ctx: &mut ModelContext<Self>) {
+        let terminal = self.terminal_driver.as_ref(ctx).terminal_view().clone();
+        terminal.update(ctx, |terminal, ctx| {
+            terminal.ai_controller().update(ctx, |controller, ctx| {
+                controller.unbind_native_prompt_conversation(ctx);
+            });
+        });
         let Some(conversation_id) = self.run_conversation_id else {
             return;
         };
@@ -1378,22 +1418,14 @@ impl AgentDriver {
                     /// How far before the sandbox deadline to start the teardown sequence.
                     const SHUTDOWN_WARNING_WINDOW: Duration = Duration::from_secs(5 * 60);
 
-                    let maybe_wait = std::env::var("WARP_SANDBOX_DEADLINE")
-                        .ok()
-                        .and_then(|s| s.parse::<i64>().ok())
-                        .and_then(|deadline_unix| {
-                            if deadline_unix <= 0 {
-                                return None;
-                            }
-                            let deadline = SystemTime::UNIX_EPOCH
-                                .checked_add(Duration::from_secs(deadline_unix as u64))?;
-                            let warning_at = deadline.checked_sub(SHUTDOWN_WARNING_WINDOW)?;
-                            match warning_at.duration_since(SystemTime::now()) {
-                                Ok(wait) => Some(wait),
-                                // Already inside the warning window — trigger immediately.
-                                Err(_) => Some(Duration::ZERO),
-                            }
-                        });
+                    let maybe_wait = sandbox_deadline().and_then(|deadline| {
+                        let warning_at = deadline.checked_sub(SHUTDOWN_WARNING_WINDOW)?;
+                        match warning_at.duration_since(SystemTime::now()) {
+                            Ok(wait) => Some(wait),
+                            // Already inside the warning window — trigger immediately.
+                            Err(_) => Some(Duration::ZERO),
+                        }
+                    });
 
                     // Resolved up front rather than inside the timer arm: `select!` arms
                     // are synchronous (no `ctx` to read the model from), and everything
@@ -2198,14 +2230,14 @@ impl AgentDriver {
                 let (
                     environment_opt,
                     additional_source_repos,
-                    repository_head_overrides,
+                    repository_preparation_overrides,
                     remove_repository_origins,
                 ) = foreground
                     .spawn(|me, _| {
                         (
                             me.environment.clone(),
                             me.additional_source_repos.clone(),
-                            me.repository_head_overrides.clone(),
+                            me.repository_preparation_overrides.clone(),
                             me.remove_repository_origins,
                         )
                     })
@@ -2274,7 +2306,7 @@ impl AgentDriver {
                                     environment::RepositoryPreparationOptions::new(
                                         source_repos_for_prepare,
                                         setup_commands,
-                                        repository_head_overrides,
+                                        repository_preparation_overrides,
                                         remove_repository_origins,
                                     ),
                                     setup_events_for_environment,
@@ -3539,7 +3571,43 @@ impl AgentDriver {
                 run_exit = run_exit.with_wait(wait);
             }
         }
-        let restored_conversation_id = self.restored_conversation_id;
+        let terminal = self.terminal_driver.as_ref(ctx).terminal_view();
+        let prepared_conversation_id = terminal
+            .as_ref(ctx)
+            .ai_controller()
+            .as_ref(ctx)
+            .native_prompt_conversation_id();
+        let restored_conversation_id = prepared_conversation_id.or(self.restored_conversation_id);
+        let queue_run_exit = run_exit.clone();
+        if let Some(conversation_id) = prepared_conversation_id {
+            let queue_run_exit = queue_run_exit.clone();
+            ctx.subscribe_to_model(&QueuedQueryModel::handle(ctx), move |me, _, event, ctx| {
+                let event_id = match event {
+                    QueuedQueryEvent::DispatchStateChanged { conversation_id }
+                    | QueuedQueryEvent::Removed {
+                        conversation_id, ..
+                    }
+                    | QueuedQueryEvent::Cleared { conversation_id } => *conversation_id,
+                    _ => return,
+                };
+                if event_id != conversation_id {
+                    return;
+                }
+                let queue = QueuedQueryModel::as_ref(ctx);
+                if !queue.has_pending_native_injections(conversation_id)
+                    && BlocklistAIHistoryModel::as_ref(ctx)
+                        .conversation(&conversation_id)
+                        .is_some_and(|conversation| {
+                            conversation.status() == &ConversationStatus::Success
+                        })
+                {
+                    queue_run_exit.complete_with_optional_idle(
+                        me.idle_on_complete,
+                        SDKConversationOutputStatus::Success,
+                    );
+                }
+            });
+        }
 
         // ServerSide prompts enter the agent view and emit
         // `CloudModeSetupPhaseEnded` to tear down the Cloud Mode Setup V2 chip.
@@ -3567,7 +3635,7 @@ impl AgentDriver {
                         .send_cloud_mode_setup_phase_ended_for_shared_session();
                 })
             });
-            if self.skip_initial_turn {
+            if self.skip_initial_turn && prepared_conversation_id.is_none() {
                 run_exit.complete_with_optional_idle(
                     self.idle_on_complete,
                     SDKConversationOutputStatus::Success,
@@ -3770,6 +3838,17 @@ impl AgentDriver {
                             }
                         };
 
+                        if matches!(output_status, SDKConversationOutputStatus::Success)
+                            && QueuedQueryModel::as_ref(ctx).has_pending_native_injections(*conversation_id)
+                        {
+                            log::info!(
+                                "event=worker_exit_deferred task_id={:?} conversation_id={conversation_id} reason=pending_native_injections queue_len={}",
+                                me.task_id, QueuedQueryModel::as_ref(ctx).queue(*conversation_id).len(),
+                            );
+                            run_exit.cancel_idle_timeout();
+                            return;
+                        }
+
                         // Errors here are terminal: in-flight recoveries surface as
                         // TransientError (handled above). Whether the process outlives either
                         // kind of terminal status is controlled by the `--idle-on-complete` /
@@ -3912,6 +3991,15 @@ impl AgentDriver {
                                 AgentViewEntryOrigin::Cli,
                                 ctx,
                             );
+                        } else if let Some(conversation_id) = prepared_conversation_id {
+                            terminal.ai_controller().update(ctx, |controller, ctx| {
+                                controller.send_user_query_in_conversation_no_lrc_subagent(
+                                    prompt_str,
+                                    conversation_id,
+                                    None,
+                                    ctx,
+                                );
+                            });
                         } else {
                             terminal.set_ai_input_mode_with_query(Some(&prompt_str), ctx);
                             terminal
@@ -3942,6 +4030,59 @@ impl AgentDriver {
                     }
                 })
             });
+
+            // Dispatch any shared-session startup follow-up that arrived while the initial
+            // prompt was being prepared. Must run after the update above returns, since
+            // `dispatch_queued_warp_agent_prompt` targets this terminal surface's *active*
+            // conversation, which the initial send just set. If more than one row accumulated,
+            // the rest are picked up one at a time by `Steering`'s piggyback-on-next-request
+            // mechanism or the idle-triggered drain, not flushed here all at once.
+            if let Some(conversation_id) = prepared_conversation_id {
+                self.terminal_driver.update(ctx, |td, ctx| {
+                    td.with_terminal_view(ctx, |terminal, ctx| {
+                        terminal.ai_controller().update(ctx, |controller, ctx| {
+                            controller.dispatch_queued_warp_agent_prompt(
+                                conversation_id,
+                                None,
+                                ctx,
+                            );
+                        });
+                    });
+                });
+            }
+        }
+
+        if self.skip_initial_turn
+            && let Some(conversation_id) = prepared_conversation_id
+        {
+            QueuedQueryModel::handle(ctx).update(ctx, |queue, ctx| {
+                queue.finish_native_setup(conversation_id, ctx);
+            });
+            // No prompt was ever sent for a promptless run, so the conversation is definitely
+            // idle here: `drain_queued_prompts` alone is sufficient, since it already detects a
+            // shared-session head row and delegates to the controller itself. A separate,
+            // preceding dispatch call would race it -- starting a second row's stream before the
+            // first produced any output cancels the first, silently dropping it.
+            self.terminal_driver.update(ctx, |td, ctx| {
+                td.with_terminal_view(ctx, |terminal, ctx| {
+                    terminal.drain_queued_prompts(conversation_id, FinishReason::Complete, ctx);
+                });
+            });
+            if !QueuedQueryModel::as_ref(ctx).has_pending_native_injections(conversation_id)
+                && !self
+                    .terminal_driver
+                    .as_ref(ctx)
+                    .terminal_view()
+                    .as_ref(ctx)
+                    .ai_controller()
+                    .as_ref(ctx)
+                    .has_active_stream_for_conversation(conversation_id, ctx)
+            {
+                queue_run_exit.complete_with_optional_idle(
+                    self.idle_on_complete,
+                    SDKConversationOutputStatus::Success,
+                );
+            }
         }
 
         // Wrap `internal_rx` instead of returning it directly: once the run's `on_commit` has

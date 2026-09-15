@@ -70,7 +70,7 @@ pub use action_model::{RunAgentsExecutor, RunAgentsExecutorEvent, RunAgentsSpawn
 )]
 pub use action_model::{
     StartAgentExecutor, StartAgentExecutorEvent, StartAgentOutcome, StartAgentRequest,
-    StartAgentRequestId,
+    StartAgentRequestId, TEAM_CHANGED_DURING_CHILD_LAUNCH_ERROR,
 };
 #[cfg(any(test, feature = "integration_tests"))]
 pub(crate) use block::model::testing::FakeAIBlockModel;
@@ -132,7 +132,8 @@ pub(crate) use persistence::PersistedAIInputType;
 pub use persistence::maybe_build_ai_query_upsert_event;
 pub(crate) use persistence::{PersistedAIInput, SerializedBlockListItem};
 pub(crate) use queued_query::{
-    AutofireAction, QueuedQuery, QueuedQueryId, QueuedQueryOrigin, is_lrc_auto_queue_active,
+    AutofireAction, QueuedPromptDeliveryMode, QueuedQuery, QueuedQueryId, QueuedQueryOrigin,
+    is_lrc_auto_queue_active,
 };
 #[cfg_attr(not(feature = "tui"), allow(unused_imports))]
 pub use queued_query::{QueuedQueryEvent, QueuedQueryModel};
