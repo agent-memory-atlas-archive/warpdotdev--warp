@@ -45,7 +45,8 @@ pub(crate) struct SaveCoordinator {
 }
 
 impl SaveCoordinator {
-    pub(super) fn request(
+    /// Coalesces an ordinary save request, or ignores it after finalization begins.
+    pub(super) fn enqueue(
         &self,
         save_point: SavePoint,
         operation: SaveOperation,
@@ -97,7 +98,7 @@ impl SaveCoordinator {
     }
 
     /// Stops ordinary requests, then drains or cancels current work before a fresh final save.
-    pub(super) async fn finish(
+    pub(super) async fn finalize(
         &self,
         final_save: impl Future<Output = Result<()>>,
         report_usage: impl Future<Output = ()>,
@@ -173,7 +174,15 @@ pub(super) async fn save_transcript_and_block(
     block: impl Future<Output = Result<()>>,
 ) -> Result<()> {
     let (transcript, block) = futures::join!(transcript, block);
-    transcript.and(block)
+    match (transcript, block) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error.context("Harness transcript save failed")),
+        (Ok(()), Err(error)) => Err(error.context("Harness block snapshot save failed")),
+        (Err(transcript), Err(block)) => Err(anyhow!(
+            "Harness transcript and block snapshot saves failed: \
+             transcript={transcript:#}; block={block:#}"
+        )),
+    }
 }
 
 #[cfg(test)]
