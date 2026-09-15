@@ -170,15 +170,13 @@ impl InitialConversationLoadState {
     }
 }
 
-/// Tracks the cooldown window for RTC-triggered task-list refreshes. Pending events keep
-/// the earliest timestamp in the burst because `updated_after` is a lower bound; using the
-/// latest timestamp could skip tasks that changed earlier in the same window.
+/// Tracks the cooldown window for RTC-triggered task refreshes.
 #[derive(Default)]
 enum RtcTaskRefreshThrottleState {
     #[default]
     Idle,
     CoolingDown {
-        pending_timestamp: Option<DateTime<Utc>>,
+        pending_task_ids: HashSet<AmbientAgentTaskId>,
         timer_abort_handle: AbortHandle,
     },
 }
@@ -824,8 +822,8 @@ impl AgentConversationsModel {
             .values()
             .any(|views| !views.is_empty());
         if has_list_consumers {
-            // (a) If management view or conversation list is open, throttled list-fetch.
-            self.handle_rtc_for_list_views(*timestamp, ctx);
+            // (a) If management view or conversation list is open, throttled point-fetch.
+            self.handle_rtc_for_list_views(*task_id, ctx);
         } else {
             let has_open_tab = ActiveAgentViewsModel::as_ref(ctx)
                 .get_terminal_view_id_for_ambient_task(*task_id)
@@ -843,21 +841,21 @@ impl AgentConversationsModel {
     // Handle RTC invalidations for list views, respecting the refresh throttling.
     fn handle_rtc_for_list_views(
         &mut self,
-        timestamp: DateTime<Utc>,
+        task_id: AmbientAgentTaskId,
         ctx: &mut ModelContext<Self>,
     ) {
         match std::mem::take(&mut self.rtc_task_refresh_throttle_state) {
             RtcTaskRefreshThrottleState::Idle => {
-                self.fetch_tasks_updated_after(timestamp, ctx);
+                self.async_fetch_task(&task_id, ctx);
                 self.start_rtc_task_refresh_throttle_timer(ctx);
             }
             RtcTaskRefreshThrottleState::CoolingDown {
-                mut pending_timestamp,
+                mut pending_task_ids,
                 timer_abort_handle,
             } => {
-                record_earliest_rtc_task_refresh_timestamp(&mut pending_timestamp, timestamp);
+                pending_task_ids.insert(task_id);
                 self.rtc_task_refresh_throttle_state = RtcTaskRefreshThrottleState::CoolingDown {
-                    pending_timestamp,
+                    pending_task_ids,
                     timer_abort_handle,
                 };
             }
@@ -870,22 +868,24 @@ impl AgentConversationsModel {
                 Timer::after(RTC_TASK_REFRESH_THROTTLE).await;
             },
             |model, _, ctx| {
-                let pending_timestamp =
+                let pending_task_ids =
                     match std::mem::take(&mut model.rtc_task_refresh_throttle_state) {
-                        RtcTaskRefreshThrottleState::Idle => None,
+                        RtcTaskRefreshThrottleState::Idle => HashSet::new(),
                         RtcTaskRefreshThrottleState::CoolingDown {
-                            pending_timestamp, ..
-                        } => pending_timestamp,
+                            pending_task_ids, ..
+                        } => pending_task_ids,
                     };
 
-                if let Some(timestamp) = pending_timestamp {
-                    model.fetch_tasks_updated_after(timestamp, ctx);
+                if !pending_task_ids.is_empty() {
+                    for task_id in pending_task_ids {
+                        model.async_fetch_task(&task_id, ctx);
+                    }
                     model.start_rtc_task_refresh_throttle_timer(ctx);
                 }
             },
         );
         self.rtc_task_refresh_throttle_state = RtcTaskRefreshThrottleState::CoolingDown {
-            pending_timestamp: None,
+            pending_task_ids: HashSet::new(),
             timer_abort_handle: future_handle.abort_handle(),
         };
     }

@@ -1,13 +1,16 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
 use instant::Instant;
+use mockito::Matcher;
 use parking_lot::Mutex;
 use persistence::model::{AgentConversationData, ConversationUsageMetadata};
 use warp_cli::agent::Harness;
 use warp_core::features::FeatureFlag;
+use warpui::r#async::Timer;
 use warpui::{App, EntityId, ModelHandle, SingletonEntity};
 
 use super::entry::{
@@ -42,6 +45,7 @@ use crate::ai::conversation_navigation::ConversationNavigationData;
 use crate::auth::AuthStateProvider;
 use crate::cloud_object::{Owner, Revision, ServerMetadata, ServerPermissions};
 use crate::server::ids::ServerId;
+use crate::server::server_api::ServerApiProvider;
 use crate::server::server_api::presigned_upload::HttpStatusError;
 use crate::test_util::ai_agent_tasks::{create_api_task, create_message};
 use crate::test_util::settings::initialize_history_persistence_for_tests;
@@ -892,6 +896,134 @@ fn rtc_task_refresh_pending_timestamp_keeps_earliest_timestamp() {
     record_earliest_rtc_task_refresh_timestamp(&mut pending_timestamp, later_timestamp);
 
     assert_eq!(pending_timestamp, Some(earliest_timestamp));
+}
+#[test]
+fn rtc_task_refresh_fetches_first_task_by_id() {
+    let task = create_test_task(&make_uuid(9800), "user-a", Utc::now());
+    let task_id = task.task_id;
+    let request = {
+        let mut server = warp_core::channel::ChannelState::mock_server();
+        server
+            .mock("GET", format!("/api/v1/agent/runs/{task_id}").as_str())
+            .match_query(Matcher::Missing)
+            .with_status(200)
+            .with_body(serde_json::to_string(&task).unwrap())
+            .expect(1)
+            .create()
+    };
+
+    App::test((), |mut app| async move {
+        app.add_singleton_model(|_| ServerApiProvider::new_for_test());
+        app.read(|ctx| {
+            ServerApiProvider::as_ref(ctx)
+                .get()
+                .set_ambient_workload_token_for_test("test-workload-token".to_string(), None);
+        });
+        let model = app.add_singleton_model(|_| create_test_model());
+        let received_task_update = Arc::new(AtomicBool::new(false));
+        app.update(|ctx| {
+            let received_task_update = received_task_update.clone();
+            ctx.subscribe_to_model(&model, move |_, event, _| {
+                if matches!(event, AgentConversationsModelEvent::TasksUpdated) {
+                    received_task_update.store(true, Ordering::SeqCst);
+                }
+            });
+        });
+
+        model.update(&mut app, |model, ctx| {
+            model.handle_rtc_for_list_views(task_id, ctx);
+        });
+        Timer::after(StdDuration::from_millis(100)).await;
+
+        model.read(&app, |model, _| {
+            assert_eq!(model.get_task_data(&task_id), Some(task));
+        });
+        assert!(received_task_update.load(Ordering::SeqCst));
+        request.assert();
+    });
+}
+
+#[test]
+fn rtc_task_refresh_deduplicates_tasks_in_trailing_flush() {
+    let leading_task = create_test_task(&make_uuid(9801), "user-a", Utc::now());
+    let trailing_task = create_test_task(&make_uuid(9802), "user-a", Utc::now());
+    let leading_task_id = leading_task.task_id;
+    let trailing_task_id = trailing_task.task_id;
+    let (leading_request, trailing_request) = {
+        let mut server = warp_core::channel::ChannelState::mock_server();
+        let leading_request = server
+            .mock(
+                "GET",
+                format!("/api/v1/agent/runs/{leading_task_id}").as_str(),
+            )
+            .with_status(200)
+            .with_body(serde_json::to_string(&leading_task).unwrap())
+            .expect(1)
+            .create();
+        let trailing_request = server
+            .mock(
+                "GET",
+                format!("/api/v1/agent/runs/{trailing_task_id}").as_str(),
+            )
+            .with_status(200)
+            .with_body(serde_json::to_string(&trailing_task).unwrap())
+            .expect(1)
+            .create();
+        (leading_request, trailing_request)
+    };
+
+    App::test((), |mut app| async move {
+        app.add_singleton_model(|_| ServerApiProvider::new_for_test());
+        app.read(|ctx| {
+            ServerApiProvider::as_ref(ctx)
+                .get()
+                .set_ambient_workload_token_for_test("test-workload-token".to_string(), None);
+        });
+        let model = app.add_singleton_model(|_| create_test_model());
+
+        model.update(&mut app, |model, ctx| {
+            model.handle_rtc_for_list_views(leading_task_id, ctx);
+            model.handle_rtc_for_list_views(trailing_task_id, ctx);
+            model.handle_rtc_for_list_views(trailing_task_id, ctx);
+        });
+        Timer::after(super::RTC_TASK_REFRESH_THROTTLE + StdDuration::from_millis(100)).await;
+
+        model.update(&mut app, |model, _| {
+            assert_eq!(model.get_task_data(&trailing_task_id), Some(trailing_task));
+            model.abort_rtc_task_refresh_throttle();
+        });
+        leading_request.assert();
+        trailing_request.assert();
+    });
+}
+
+#[test]
+fn rtc_task_refresh_reset_aborts_timer_and_discards_pending_tasks() {
+    App::test((), |mut app| async move {
+        let leading_task_id = make_uuid(9803).parse().unwrap();
+        let pending_task_id = make_uuid(9804).parse().unwrap();
+        let model = app.add_singleton_model(|_| {
+            let mut model = create_test_model();
+            model
+                .task_fetch_state
+                .insert(leading_task_id, TaskFetchState::InFlight);
+            model
+        });
+
+        model.update(&mut app, |model, ctx| {
+            model.handle_rtc_for_list_views(leading_task_id, ctx);
+            model.handle_rtc_for_list_views(pending_task_id, ctx);
+            model.reset();
+        });
+
+        model.read(&app, |model, _| {
+            assert!(matches!(
+                model.rtc_task_refresh_throttle_state,
+                RtcTaskRefreshThrottleState::Idle
+            ));
+            assert!(model.task_fetch_state.is_empty());
+        });
+    });
 }
 
 #[test]
