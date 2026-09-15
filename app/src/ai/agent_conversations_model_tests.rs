@@ -4,6 +4,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
+use futures::future::{Either, select};
+use futures::pin_mut;
 use instant::Instant;
 use mockito::Matcher;
 use parking_lot::Mutex;
@@ -120,6 +122,43 @@ fn subscribe_to_conversation_updated(
         });
     });
     captured
+}
+
+fn subscribe_to_tasks_updated(
+    app: &mut App,
+    model: &ModelHandle<AgentConversationsModel>,
+) -> async_channel::Receiver<()> {
+    let (sender, receiver) = async_channel::bounded(4);
+    app.update(|ctx| {
+        ctx.subscribe_to_model(model, move |_, event, _| {
+            if matches!(event, AgentConversationsModelEvent::TasksUpdated) {
+                let _ = sender.try_send(());
+            }
+        });
+    });
+    receiver
+}
+
+async fn wait_for_task_update(receiver: &async_channel::Receiver<()>, timeout: StdDuration) {
+    let receive = receiver.recv();
+    let deadline = Timer::after(timeout);
+    pin_mut!(receive, deadline);
+    match select(receive, deadline).await {
+        Either::Left((Ok(()), _)) => {}
+        Either::Left((Err(error), _)) => panic!("task-update channel closed: {error}"),
+        Either::Right(_) => panic!("timed out waiting for task update"),
+    }
+}
+
+async fn assert_no_task_update(receiver: &async_channel::Receiver<()>, timeout: StdDuration) {
+    let receive = receiver.recv();
+    let deadline = Timer::after(timeout);
+    pin_mut!(receive, deadline);
+    match select(receive, deadline).await {
+        Either::Left((Ok(()), _)) => panic!("received an unexpected task update"),
+        Either::Left((Err(error), _)) => panic!("task-update channel closed: {error}"),
+        Either::Right(_) => {}
+    }
 }
 
 #[test]
@@ -920,25 +959,16 @@ fn rtc_task_refresh_fetches_first_task_by_id() {
                 .set_ambient_workload_token_for_test("test-workload-token".to_string(), None);
         });
         let model = app.add_singleton_model(|_| create_test_model());
-        let received_task_update = Arc::new(AtomicBool::new(false));
-        app.update(|ctx| {
-            let received_task_update = received_task_update.clone();
-            ctx.subscribe_to_model(&model, move |_, event, _| {
-                if matches!(event, AgentConversationsModelEvent::TasksUpdated) {
-                    received_task_update.store(true, Ordering::SeqCst);
-                }
-            });
-        });
+        let task_updates = subscribe_to_tasks_updated(&mut app, &model);
 
         model.update(&mut app, |model, ctx| {
             model.handle_rtc_for_list_views(task_id, ctx);
         });
-        Timer::after(StdDuration::from_millis(100)).await;
+        wait_for_task_update(&task_updates, StdDuration::from_secs(1)).await;
 
         model.read(&app, |model, _| {
             assert_eq!(model.get_task_data(&task_id), Some(task));
         });
-        assert!(received_task_update.load(Ordering::SeqCst));
         request.assert();
     });
 }
@@ -980,13 +1010,23 @@ fn rtc_task_refresh_deduplicates_tasks_in_trailing_flush() {
                 .set_ambient_workload_token_for_test("test-workload-token".to_string(), None);
         });
         let model = app.add_singleton_model(|_| create_test_model());
+        let task_updates = subscribe_to_tasks_updated(&mut app, &model);
+
+        model.update(&mut app, |model, ctx| {
+            model.handle_rtc_for_list_views(leading_task_id, ctx);
+        });
+        wait_for_task_update(&task_updates, StdDuration::from_secs(1)).await;
 
         model.update(&mut app, |model, ctx| {
             model.handle_rtc_for_list_views(leading_task_id, ctx);
             model.handle_rtc_for_list_views(trailing_task_id, ctx);
             model.handle_rtc_for_list_views(trailing_task_id, ctx);
         });
-        Timer::after(super::RTC_TASK_REFRESH_THROTTLE + StdDuration::from_millis(100)).await;
+        wait_for_task_update(
+            &task_updates,
+            super::RTC_TASK_REFRESH_THROTTLE + StdDuration::from_secs(1),
+        )
+        .await;
 
         model.update(&mut app, |model, _| {
             assert_eq!(model.get_task_data(&trailing_task_id), Some(trailing_task));
@@ -999,9 +1039,28 @@ fn rtc_task_refresh_deduplicates_tasks_in_trailing_flush() {
 
 #[test]
 fn rtc_task_refresh_reset_aborts_timer_and_discards_pending_tasks() {
+    let pending_task = create_test_task(&make_uuid(9804), "user-a", Utc::now());
+    let pending_task_id = pending_task.task_id;
+    let pending_request = {
+        let mut server = warp_core::channel::ChannelState::mock_server();
+        server
+            .mock(
+                "GET",
+                format!("/api/v1/agent/runs/{pending_task_id}").as_str(),
+            )
+            .with_status(200)
+            .with_body(serde_json::to_string(&pending_task).unwrap())
+            .expect(0)
+            .create()
+    };
     App::test((), |mut app| async move {
         let leading_task_id = make_uuid(9803).parse().unwrap();
-        let pending_task_id = make_uuid(9804).parse().unwrap();
+        app.add_singleton_model(|_| ServerApiProvider::new_for_test());
+        app.read(|ctx| {
+            ServerApiProvider::as_ref(ctx)
+                .get()
+                .set_ambient_workload_token_for_test("test-workload-token".to_string(), None);
+        });
         let model = app.add_singleton_model(|_| {
             let mut model = create_test_model();
             model
@@ -1009,20 +1068,19 @@ fn rtc_task_refresh_reset_aborts_timer_and_discards_pending_tasks() {
                 .insert(leading_task_id, TaskFetchState::InFlight);
             model
         });
+        let task_updates = subscribe_to_tasks_updated(&mut app, &model);
 
         model.update(&mut app, |model, ctx| {
             model.handle_rtc_for_list_views(leading_task_id, ctx);
             model.handle_rtc_for_list_views(pending_task_id, ctx);
             model.reset();
         });
-
-        model.read(&app, |model, _| {
-            assert!(matches!(
-                model.rtc_task_refresh_throttle_state,
-                RtcTaskRefreshThrottleState::Idle
-            ));
-            assert!(model.task_fetch_state.is_empty());
-        });
+        assert_no_task_update(
+            &task_updates,
+            super::RTC_TASK_REFRESH_THROTTLE + StdDuration::from_secs(1),
+        )
+        .await;
+        pending_request.assert();
     });
 }
 

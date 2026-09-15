@@ -176,6 +176,7 @@ enum RtcTaskRefreshThrottleState {
     #[default]
     Idle,
     CoolingDown {
+        dispatched_task_ids: HashSet<AmbientAgentTaskId>,
         pending_task_ids: HashSet<AmbientAgentTaskId>,
         timer_abort_handle: AbortHandle,
     },
@@ -822,7 +823,6 @@ impl AgentConversationsModel {
             .values()
             .any(|views| !views.is_empty());
         if has_list_consumers {
-            // (a) If management view or conversation list is open, throttled point-fetch.
             self.handle_rtc_for_list_views(*task_id, ctx);
         } else {
             let has_open_tab = ActiveAgentViewsModel::as_ref(ctx)
@@ -847,14 +847,18 @@ impl AgentConversationsModel {
         match std::mem::take(&mut self.rtc_task_refresh_throttle_state) {
             RtcTaskRefreshThrottleState::Idle => {
                 self.async_fetch_task(&task_id, ctx);
-                self.start_rtc_task_refresh_throttle_timer(ctx);
+                self.start_rtc_task_refresh_throttle_timer(HashSet::from([task_id]), ctx);
             }
             RtcTaskRefreshThrottleState::CoolingDown {
+                mut dispatched_task_ids,
                 mut pending_task_ids,
                 timer_abort_handle,
             } => {
-                pending_task_ids.insert(task_id);
+                if dispatched_task_ids.insert(task_id) {
+                    pending_task_ids.insert(task_id);
+                }
                 self.rtc_task_refresh_throttle_state = RtcTaskRefreshThrottleState::CoolingDown {
+                    dispatched_task_ids,
                     pending_task_ids,
                     timer_abort_handle,
                 };
@@ -862,7 +866,11 @@ impl AgentConversationsModel {
         }
     }
 
-    fn start_rtc_task_refresh_throttle_timer(&mut self, ctx: &mut ModelContext<Self>) {
+    fn start_rtc_task_refresh_throttle_timer(
+        &mut self,
+        dispatched_task_ids: HashSet<AmbientAgentTaskId>,
+        ctx: &mut ModelContext<Self>,
+    ) {
         let future_handle = ctx.spawn(
             async move {
                 Timer::after(RTC_TASK_REFRESH_THROTTLE).await;
@@ -877,14 +885,15 @@ impl AgentConversationsModel {
                     };
 
                 if !pending_task_ids.is_empty() {
-                    for task_id in pending_task_ids {
-                        model.async_fetch_task(&task_id, ctx);
+                    for task_id in &pending_task_ids {
+                        model.async_fetch_task(task_id, ctx);
                     }
-                    model.start_rtc_task_refresh_throttle_timer(ctx);
+                    model.start_rtc_task_refresh_throttle_timer(pending_task_ids, ctx);
                 }
             },
         );
         self.rtc_task_refresh_throttle_state = RtcTaskRefreshThrottleState::CoolingDown {
+            dispatched_task_ids,
             pending_task_ids: HashSet::new(),
             timer_abort_handle: future_handle.abort_handle(),
         };
