@@ -7309,7 +7309,7 @@ impl PaneGroup {
         );
     }
 
-    pub fn swap_active_pane_to_conversation_with_origin(
+    pub(in crate::pane_group) fn swap_active_pane_to_conversation_with_origin(
         &mut self,
         focused_pane_id: PaneId,
         conversation_id: AIConversationId,
