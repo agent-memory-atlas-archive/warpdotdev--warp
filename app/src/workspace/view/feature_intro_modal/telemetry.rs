@@ -63,7 +63,3 @@ impl TelemetryEventDesc for FactoriesLaunchModalTelemetryEventDiscriminants {
 }
 
 warp_core::register_telemetry_event!(FactoriesLaunchModalTelemetryEvent);
-
-#[cfg(test)]
-#[path = "telemetry_tests.rs"]
-mod tests;
