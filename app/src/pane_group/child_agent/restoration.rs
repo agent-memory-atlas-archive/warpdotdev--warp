@@ -39,6 +39,7 @@ use crate::uri::browser_url_resolution::BrowserNavigationOrigin;
 #[cfg(target_family = "wasm")]
 use crate::uri::viewer_location::{
     ChildAnchor, HydratedAnchorAction, ViewerLocation, hydrated_anchor_action,
+    is_expected_direct_child,
 };
 
 /// Max direct children fetched per ancestor-list restore seed. The server
@@ -393,15 +394,14 @@ impl PaneGroup {
                     .is_some()
             })
             .collect::<HashSet<_>>();
-        let conversation_id = match hydrated_anchor_action(
+        match hydrated_anchor_action(
             location.child_anchor,
             &seeded_child_ids,
             &registered_child_ids,
         ) {
-            HydratedAnchorAction::None => return,
+            HydratedAnchorAction::None => {}
             HydratedAnchorAction::Clear => {
                 update_viewer_selection(None, BrowserNavigationOrigin::InvalidAnchorCleanup);
-                return;
             }
             HydratedAnchorAction::Wait => {
                 let ChildAnchor::Selected(task_id) = location.child_anchor else {
@@ -411,21 +411,42 @@ impl PaneGroup {
                     update_viewer_selection(None, BrowserNavigationOrigin::InvalidAnchorCleanup);
                     return;
                 };
-                let name = child_task.display_name().to_string();
-                let fallback_title = child_task.title.trim().to_string();
-                let harness = agent_task_harness(child_task);
-                BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
-                    history.ensure_remote_child_conversation(
-                        terminal_surface_id,
-                        parent_conversation_id,
-                        child_task.task_id.to_string(),
-                        child_task.task_id,
-                        name,
-                        fallback_title,
-                        harness,
-                        ctx,
-                    )
-                })
+                self.restore_initial_child_task(
+                    parent_conversation_id,
+                    parent_pane_id,
+                    terminal_surface_id,
+                    child_task,
+                    ctx,
+                );
+            }
+            HydratedAnchorAction::FetchAndVerify(task_id) => {
+                let ai_client = ServerApiProvider::as_ref(ctx).get_ai_client();
+                ctx.spawn(
+                    async move { ai_client.get_ambient_agent_task(&task_id).await },
+                    move |me, result, ctx| {
+                        let Ok(task) = result else {
+                            update_viewer_selection(
+                                None,
+                                BrowserNavigationOrigin::InvalidAnchorCleanup,
+                            );
+                            return;
+                        };
+                        if !is_expected_direct_child(&task, task_id, parent_task_id) {
+                            update_viewer_selection(
+                                None,
+                                BrowserNavigationOrigin::InvalidAnchorCleanup,
+                            );
+                            return;
+                        }
+                        me.restore_initial_child_task(
+                            parent_conversation_id,
+                            parent_pane_id,
+                            terminal_surface_id,
+                            &task,
+                            ctx,
+                        );
+                    },
+                );
             }
             HydratedAnchorAction::Select(task_id) => {
                 let Some(conversation_id) = BlocklistAIHistoryModel::as_ref(ctx)
@@ -434,9 +455,45 @@ impl PaneGroup {
                     update_viewer_selection(None, BrowserNavigationOrigin::InvalidAnchorCleanup);
                     return;
                 };
-                conversation_id
+                self.restore_initial_child_conversation(parent_pane_id, conversation_id, ctx);
             }
-        };
+        }
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn restore_initial_child_task(
+        &mut self,
+        parent_conversation_id: AIConversationId,
+        parent_pane_id: PaneId,
+        terminal_surface_id: warpui::EntityId,
+        child_task: &AmbientAgentTask,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let name = child_task.display_name().to_string();
+        let fallback_title = child_task.title.trim().to_string();
+        let harness = agent_task_harness(child_task);
+        let conversation_id = BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
+            history.ensure_remote_child_conversation(
+                terminal_surface_id,
+                parent_conversation_id,
+                child_task.task_id.to_string(),
+                child_task.task_id,
+                name,
+                fallback_title,
+                harness,
+                ctx,
+            )
+        });
+        self.restore_initial_child_conversation(parent_pane_id, conversation_id, ctx);
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn restore_initial_child_conversation(
+        &mut self,
+        parent_pane_id: PaneId,
+        conversation_id: AIConversationId,
+        ctx: &mut ViewContext<Self>,
+    ) {
         if self.ensure_hidden_child_agent_pane_for_conversation(conversation_id, ctx) {
             self.swap_active_pane_to_conversation_with_origin(
                 parent_pane_id,

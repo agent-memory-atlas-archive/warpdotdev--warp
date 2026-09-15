@@ -31,6 +31,7 @@ pub(crate) enum ChildAnchor {
 pub(crate) enum HydratedAnchorAction {
     None,
     Wait,
+    FetchAndVerify(AmbientAgentTaskId),
     Select(AmbientAgentTaskId),
     Clear,
 }
@@ -44,14 +45,28 @@ pub(crate) fn hydrated_anchor_action(
     match anchor {
         ChildAnchor::Root => HydratedAnchorAction::None,
         ChildAnchor::Invalid => HydratedAnchorAction::Clear,
-        ChildAnchor::Selected(task_id) if !seeded_child_ids.contains(&task_id) => {
-            HydratedAnchorAction::Clear
+        ChildAnchor::Selected(task_id) if registered_child_ids.contains(&task_id) => {
+            HydratedAnchorAction::Select(task_id)
         }
-        ChildAnchor::Selected(task_id) if !registered_child_ids.contains(&task_id) => {
+        ChildAnchor::Selected(task_id) if seeded_child_ids.contains(&task_id) => {
             HydratedAnchorAction::Wait
         }
-        ChildAnchor::Selected(task_id) => HydratedAnchorAction::Select(task_id),
+        ChildAnchor::Selected(task_id) => HydratedAnchorAction::FetchAndVerify(task_id),
     }
+}
+
+#[cfg(any(target_family = "wasm", test))]
+pub(crate) fn is_expected_direct_child(
+    task: &AmbientAgentTask,
+    expected_task_id: AmbientAgentTaskId,
+    parent_task_id: AmbientAgentTaskId,
+) -> bool {
+    task.task_id == expected_task_id
+        && task
+            .parent_run_id
+            .as_deref()
+            .and_then(|parent_run_id| parent_run_id.parse().ok())
+            == Some(parent_task_id)
 }
 
 #[cfg(any(target_family = "wasm", test))]

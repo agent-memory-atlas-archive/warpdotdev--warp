@@ -228,7 +228,7 @@ fn root_without_a_reachable_route_stays_standalone() {
 }
 
 #[test]
-fn anchor_waits_for_registration_after_seed_and_clears_unmatched_values() {
+fn anchor_waits_for_registration_and_verifies_unseeded_values() {
     let child_id = CHILD.parse().unwrap();
     let seeded = HashSet::from([child_id]);
     assert_eq!(
@@ -245,12 +245,69 @@ fn anchor_waits_for_registration_after_seed_and_clears_unmatched_values() {
             &seeded,
             &seeded
         ),
-        HydratedAnchorAction::Clear
+        HydratedAnchorAction::FetchAndVerify(ROOT.parse().unwrap())
     );
     assert_eq!(
         hydrated_anchor_action(ChildAnchor::Invalid, &seeded, &seeded),
         HydratedAnchorAction::Clear
     );
+}
+
+#[test]
+fn anchor_omitted_from_first_hundred_requires_verified_direct_child_fetch() {
+    let parent_task_id = ROOT.parse().unwrap();
+    let child_task_id = CHILD.parse().unwrap();
+    let first_page = (3..=102)
+        .map(|value| {
+            uuid::Uuid::from_u128(value)
+                .to_string()
+                .parse::<AmbientAgentTaskId>()
+                .unwrap()
+        })
+        .collect::<HashSet<_>>();
+    assert_eq!(first_page.len(), 100);
+    assert_eq!(
+        hydrated_anchor_action(
+            ChildAnchor::Selected(child_task_id),
+            &first_page,
+            &HashSet::new()
+        ),
+        HydratedAnchorAction::FetchAndVerify(child_task_id)
+    );
+    assert_eq!(
+        hydrated_anchor_action(
+            ChildAnchor::Selected(child_task_id),
+            &first_page,
+            &HashSet::from([child_task_id])
+        ),
+        HydratedAnchorAction::Select(child_task_id)
+    );
+
+    assert!(is_expected_direct_child(
+        &task(CHILD, Some(ROOT)),
+        child_task_id,
+        parent_task_id
+    ));
+    assert!(!is_expected_direct_child(
+        &task(CHILD, Some("33333333-3333-3333-3333-333333333333")),
+        child_task_id,
+        parent_task_id
+    ));
+    assert!(!is_expected_direct_child(
+        &task(CHILD, None),
+        child_task_id,
+        parent_task_id
+    ));
+    assert!(!is_expected_direct_child(
+        &task(CHILD, Some("not-a-run-id")),
+        child_task_id,
+        parent_task_id
+    ));
+    assert!(!is_expected_direct_child(
+        &task(ROOT, Some(ROOT)),
+        child_task_id,
+        parent_task_id
+    ));
 }
 
 #[test]

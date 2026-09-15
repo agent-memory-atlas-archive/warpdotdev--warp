@@ -34,6 +34,7 @@ use crate::uri::browser_url_handler::parse_current_url;
 #[cfg(target_family = "wasm")]
 use crate::uri::viewer_location::{
     ChildAnchor, HydratedAnchorAction, ViewerLocation, hydrated_anchor_action,
+    is_expected_direct_child,
 };
 
 /// Refetch cadence for children whose claim-time `session_id` is not yet known.
@@ -559,34 +560,53 @@ impl OrchestrationViewerModel {
                 return;
             }
             HydratedAnchorAction::Wait => {
-                if self.initial_anchor_fetch_in_flight {
-                    return;
-                }
                 let ChildAnchor::Selected(task_id) = self.initial_child_anchor else {
                     return;
                 };
-                self.initial_anchor_fetch_in_flight = true;
-                let ai_client = ServerApiProvider::as_ref(ctx).get_ai_client();
-                ctx.spawn(
-                    async move { ai_client.get_ambient_agent_task(&task_id).await },
-                    move |me, result, ctx| {
-                        me.initial_anchor_fetch_in_flight = false;
-                        match result {
-                            Ok(task) if task.task_id == task_id => {
-                                me.register_child(task, ctx);
-                            }
-                            Ok(_) | Err(_) => {
-                                me.finish_initial_anchor_resolution(None, ctx);
-                            }
-                        }
-                    },
-                );
+                self.fetch_initial_anchor_task(task_id, false, ctx);
+                return;
+            }
+            HydratedAnchorAction::FetchAndVerify(task_id) => {
+                self.fetch_initial_anchor_task(task_id, true, ctx);
                 return;
             }
             HydratedAnchorAction::Clear => None,
             HydratedAnchorAction::Select(task_id) => Some(self.children[&task_id].conversation_id),
         };
         self.finish_initial_anchor_resolution(conversation_id, ctx);
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn fetch_initial_anchor_task(
+        &mut self,
+        task_id: AmbientAgentTaskId,
+        verify_parent: bool,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if self.initial_anchor_fetch_in_flight {
+            return;
+        }
+        self.initial_anchor_fetch_in_flight = true;
+        let ai_client = ServerApiProvider::as_ref(ctx).get_ai_client();
+        let parent_task_id = self.parent_task_id;
+        ctx.spawn(
+            async move { ai_client.get_ambient_agent_task(&task_id).await },
+            move |me, result, ctx| {
+                me.initial_anchor_fetch_in_flight = false;
+                match result {
+                    Ok(task)
+                        if task.task_id == task_id
+                            && (!verify_parent
+                                || is_expected_direct_child(&task, task_id, parent_task_id)) =>
+                    {
+                        me.register_child(task, ctx);
+                    }
+                    Ok(_) | Err(_) => {
+                        me.finish_initial_anchor_resolution(None, ctx);
+                    }
+                }
+            },
+        );
     }
 
     #[cfg(target_family = "wasm")]
