@@ -20,6 +20,8 @@ use crate::features::FeatureFlag;
 mod convert;
 mod model;
 
+#[cfg(test)]
+pub use model::TestModel;
 pub use model::{Event as ServerExperimentsEvent, ServerExperiments};
 
 /// The known server-side experiments.

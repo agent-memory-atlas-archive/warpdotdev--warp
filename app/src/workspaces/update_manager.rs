@@ -498,6 +498,11 @@ impl TeamUpdateManager {
                         usage_model.apply_server_availability(Ok(availability), ctx);
                     });
                 }
+                if let Some(experiments) = experiments {
+                    ServerApiProvider::handle(ctx).update(ctx, |provider, ctx| {
+                        provider.handle_experiments_fetched(experiments, ctx);
+                    });
+                }
 
                 UserWorkspaces::handle(ctx).update(ctx, |user_workspaces, ctx| {
                     user_workspaces.set_user_purchase_policy(user_purchase_policy);
@@ -517,12 +522,6 @@ impl TeamUpdateManager {
                     };
                 } else if let Some(workspace_uid) = workspaces.first().map(|w| w.uid) {
                     self.set_current_workspace_uid(workspace_uid, ctx);
-                }
-
-                if let Some(experiments) = experiments {
-                    ServerApiProvider::handle(ctx).update(ctx, |provider, ctx| {
-                        provider.handle_experiments_fetched(experiments, ctx);
-                    });
                 }
 
                 // Update sqlite

@@ -1,9 +1,11 @@
 use std::future::Future;
+use std::sync::Arc;
 
 use ai::api_keys::ApiKeyManager;
 use settings::Setting as _;
 use warp_core::features::FeatureFlag;
 use warp_core::send_telemetry_from_ctx;
+use warp_server_client::auth::AuthClient;
 use warp_util::sync::Condition;
 use warpui::{AppContext, Entity, ModelContext, SingletonEntity, WindowId};
 
@@ -20,6 +22,7 @@ use crate::auth::auth_manager::AuthManagerEvent;
 use crate::auth::{AuthManager, AuthStateProvider};
 use crate::channel::{Channel, ChannelState};
 use crate::root_view::has_completed_local_onboarding;
+use crate::server::server_api::ServerApiProvider;
 use crate::settings::cloud_preferences_syncer::{
     CloudPreferencesSyncer, CloudPreferencesSyncerEvent,
 };
@@ -36,6 +39,7 @@ use crate::workspaces::workspace::CustomerType;
 /// a modal is currently being shown and automatically triggers the modal when appropriate
 /// conditions are met (e.g., user becomes onboarded).
 pub struct OneTimeModalModel {
+    auth_client: Arc<dyn AuthClient>,
     is_build_plan_migration_modal_open: bool,
     /// Whether the Oz launch modal is currently being shown.
     is_oz_launch_modal_open: bool,
@@ -60,6 +64,7 @@ pub struct OneTimeModalModel {
     /// intentionally excluded from `is_any_modal_open` (which suppresses terminal
     /// focus stealing) to keep the terminal usable while it is visible.
     active_feature_intro: Option<FeatureIntroId>,
+    factories_launch_intro_claim_in_flight: bool,
     /// Whether the initial one-time modal checks have run. The seen markers are
     /// cloud-synced settings, so event-driven re-checks must wait for the initial
     /// cloud preferences load to avoid acting on stale values.
@@ -75,6 +80,7 @@ pub struct OneTimeModalModel {
 
 impl OneTimeModalModel {
     pub fn new(ctx: &mut ModelContext<Self>) -> Self {
+        let auth_client = ServerApiProvider::as_ref(ctx).get_auth_client();
         // Subscribe to UserWorkspaces to detect when sunsetted_to_build_ts changes
         ctx.subscribe_to_model(
             &crate::workspaces::user_workspaces::UserWorkspaces::handle(ctx),
@@ -172,6 +178,7 @@ impl OneTimeModalModel {
         auto_handoff_sleep_modal_closed.set();
 
         Self {
+            auth_client,
             is_build_plan_migration_modal_open: false,
             is_oz_launch_modal_open: false,
             is_openwarp_launch_modal_open: false,
@@ -182,6 +189,7 @@ impl OneTimeModalModel {
             is_free_ai_removal_modal_open: false,
             is_hoa_onboarding_open: false,
             active_feature_intro: None,
+            factories_launch_intro_claim_in_flight: false,
             has_completed_initial_modal_checks: false,
             has_fetched_workspaces: false,
             target_window_id: None,
@@ -468,6 +476,9 @@ impl OneTimeModalModel {
         if cfg!(target_family = "wasm") {
             return;
         }
+        if self.factories_launch_intro_claim_in_flight {
+            return;
+        }
 
         // Existing users should never see the code toolbelt new feature popup.
         CodeSettings::handle(ctx).update(ctx, |settings, ctx| {
@@ -545,6 +556,7 @@ impl OneTimeModalModel {
         if !self.has_completed_initial_modal_checks
             || self.is_any_modal_open()
             || self.active_feature_intro.is_some()
+            || self.factories_launch_intro_claim_in_flight
         {
             return;
         }
@@ -555,6 +567,7 @@ impl OneTimeModalModel {
         if !self.has_completed_initial_modal_checks
             || self.is_any_modal_open()
             || self.active_feature_intro.is_some()
+            || self.factories_launch_intro_claim_in_flight
         {
             return;
         }
@@ -767,6 +780,9 @@ impl OneTimeModalModel {
     }
 
     fn check_and_trigger_feature_intro_modal(&mut self, ctx: &mut ModelContext<Self>) -> bool {
+        if self.factories_launch_intro_claim_in_flight {
+            return true;
+        }
         let next_id = FEATURE_INTROS
             .iter()
             .find(|intro| {
@@ -778,17 +794,43 @@ impl OneTimeModalModel {
             return false;
         };
 
-        // Mark it seen up front so it shows at most once, even if suppressed below.
+        let should_show = !matches!(ChannelState::channel(), Channel::Integration);
+        if id == FeatureIntroId::FactoriesLaunch && should_show {
+            self.factories_launch_intro_claim_in_flight = true;
+            let auth_client = self.auth_client.clone();
+            let _ = ctx.spawn(
+                async move { auth_client.claim_factories_launch_intro().await },
+                move |me, result, ctx| {
+                    me.factories_launch_intro_claim_in_flight = false;
+                    match result {
+                        Ok(claimed) => {
+                            AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                                settings.mark_feature_intro_seen(id.as_key(), ctx);
+                            });
+                            if claimed && me.set_active_feature_intro(Some(id), ctx) {
+                                send_telemetry_from_ctx!(
+                                    FactoriesLaunchModalTelemetryEvent::Shown,
+                                    ctx
+                                );
+                            } else if !claimed {
+                                me.resume_modal_checks_after_feature_intro(ctx);
+                            }
+                        }
+                        Err(error) => {
+                            log::warn!("Failed to claim Factories launch intro: {error:#}");
+                            me.resume_modal_checks_after_feature_intro(ctx);
+                        }
+                    }
+                },
+            );
+            return true;
+        }
+
         AISettings::handle(ctx).update(ctx, |settings, ctx| {
             settings.mark_feature_intro_seen(id.as_key(), ctx);
         });
-
-        let should_show = !matches!(ChannelState::channel(), Channel::Integration);
         if should_show {
             self.set_active_feature_intro(Some(id), ctx);
-            if id == FeatureIntroId::FactoriesLaunch {
-                send_telemetry_from_ctx!(FactoriesLaunchModalTelemetryEvent::Shown, ctx);
-            }
         }
         should_show
     }

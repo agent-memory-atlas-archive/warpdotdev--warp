@@ -50,7 +50,7 @@ impl FeatureIntroId {
                 FeatureFlag::FactoriesLaunchModal.is_enabled()
                     && UserWorkspaces::as_ref(app)
                         .factories_launch_modal_cta_url()
-                        .is_some()
+                        .is_some_and(|url| !url.trim().is_empty())
             }
         }
     }

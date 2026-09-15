@@ -3159,6 +3159,7 @@ type RootMutation {
   addInviteLinkDomainRestriction(input: AddInviteLinkDomainRestrictionInput!, requestContext: RequestContext!): AddInviteLinkDomainRestrictionResult!
   addObjectGuests(input: AddObjectGuestsInput!, requestContext: RequestContext!): AddObjectGuestsResult!
   bulkCreateObjects(input: BulkCreateObjectsInput!, requestContext: RequestContext!): BulkCreateObjectsResult!
+  claimFactoriesLaunchIntro(requestContext: RequestContext!): ClaimFactoriesLaunchIntroResult!
   confirmFileArtifactUpload(input: ConfirmFileArtifactUploadInput!, requestContext: RequestContext!): ConfirmFileArtifactUploadResult!
 
   """
@@ -3561,6 +3562,13 @@ type SetUserIsOnboardedOutput implements Response {
 }
 
 union SetUserIsOnboardedResult = SetUserIsOnboardedOutput | UserFacingError
+
+type ClaimFactoriesLaunchIntroOutput implements Response {
+  claimed: Boolean!
+  responseContext: ResponseContext!
+}
+
+union ClaimFactoriesLaunchIntroResult = ClaimFactoriesLaunchIntroOutput | UserFacingError
 
 input ShareBlockInput {
   block: BlockInput!
