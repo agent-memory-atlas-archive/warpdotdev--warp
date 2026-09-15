@@ -37,7 +37,7 @@ fn test_find_matching_config() {
 }
 
 #[test]
-fn changed_selection_pushes_once_but_repeated_selection_does_not_write() {
+fn anchor_selection_pushes_once_but_repeated_selection_does_not_write() {
     let root = Url::parse("https://app.warp.dev/conversation/root").unwrap();
     let child = Url::parse(
         "https://app.warp.dev/conversation/root#child=22222222-2222-2222-2222-222222222222",
@@ -47,7 +47,7 @@ fn changed_selection_pushes_once_but_repeated_selection_does_not_write() {
     let changed = browser_url_resolution::resolve_browser_url(
         Some(root),
         Some(child.clone()),
-        browser_url_resolution::BrowserNavigationOrigin::ChangedSelection,
+        browser_url_resolution::BrowserNavigationOrigin::AnchorSelection,
     );
     assert_eq!(
         changed.write,
@@ -57,7 +57,7 @@ fn changed_selection_pushes_once_but_repeated_selection_does_not_write() {
     let repeated = browser_url_resolution::resolve_browser_url(
         Some(child.clone()),
         Some(child),
-        browser_url_resolution::BrowserNavigationOrigin::ChangedSelection,
+        browser_url_resolution::BrowserNavigationOrigin::AnchorSelection,
     );
     assert_eq!(
         repeated.write,
@@ -68,7 +68,7 @@ fn changed_selection_pushes_once_but_repeated_selection_does_not_write() {
     let selected_root = browser_url_resolution::resolve_browser_url(
         repeated.url,
         Some(root),
-        browser_url_resolution::BrowserNavigationOrigin::ChangedSelection,
+        browser_url_resolution::BrowserNavigationOrigin::AnchorSelection,
     );
     assert_eq!(
         selected_root.write,
@@ -77,7 +77,7 @@ fn changed_selection_pushes_once_but_repeated_selection_does_not_write() {
 }
 
 #[test]
-fn automatic_route_changes_preserve_anchor_and_standalone_state() {
+fn route_sync_preserves_anchor_and_standalone_state() {
     for (current, expected_standalone) in [
         (
             format!(
@@ -104,7 +104,7 @@ fn automatic_route_changes_preserve_anchor_and_standalone_state() {
                 ))
                 .unwrap(),
             ),
-            browser_url_resolution::BrowserNavigationOrigin::AutomaticRootRouteChange,
+            browser_url_resolution::BrowserNavigationOrigin::RouteSync,
         );
         let resolved = resolved.url.unwrap();
         assert_eq!(
@@ -125,7 +125,7 @@ fn automatic_route_changes_preserve_anchor_and_standalone_state() {
             browser_url_resolution::resolve_browser_url(
                 Some(resolved.clone()),
                 Some(resolved),
-                browser_url_resolution::BrowserNavigationOrigin::AutomaticRootRouteChange,
+                browser_url_resolution::BrowserNavigationOrigin::RouteSync,
             )
             .write,
             browser_url_resolution::BrowserHistoryWrite::None
@@ -134,21 +134,20 @@ fn automatic_route_changes_preserve_anchor_and_standalone_state() {
 }
 
 #[test]
-fn history_and_initial_restoration_do_not_write() {
+fn initial_restoration_does_not_write() {
     let url = Url::parse(
         "https://app.warp.dev/conversation/root#child=22222222-2222-2222-2222-222222222222",
     )
     .unwrap();
-    for origin in [
-        browser_url_resolution::BrowserNavigationOrigin::BrowserHistory,
+    let resolved = browser_url_resolution::resolve_browser_url(
+        Some(url),
+        None,
         browser_url_resolution::BrowserNavigationOrigin::InitialAnchorRestoration,
-    ] {
-        let resolved = browser_url_resolution::resolve_browser_url(Some(url.clone()), None, origin);
-        assert_eq!(
-            resolved.write,
-            browser_url_resolution::BrowserHistoryWrite::None
-        );
-    }
+    );
+    assert_eq!(
+        resolved.write,
+        browser_url_resolution::BrowserHistoryWrite::None
+    );
 }
 
 #[test]
@@ -409,32 +408,6 @@ fn test_app_web_link_rewrites_to_new_cloud_agent_conversation() {
 }
 
 #[test]
-fn resolve_browser_url_keeps_parent_conversation_view_when_child_pane_has_its_own_link() {
-    let parent_url = Url::parse(&format!(
-        "{}/conversation/parent-token",
-        ChannelState::server_root_url()
-    ))
-    .unwrap();
-    let child_session_url = Url::parse(&format!(
-        "{}/session/317d0686-7a0b-4b67-806b-aaa3e9df501b",
-        ChannelState::server_root_url()
-    ))
-    .unwrap();
-
-    let resolved = browser_url_resolution::resolve_browser_url(
-        Some(parent_url.clone()),
-        Some(child_session_url),
-        browser_url_resolution::BrowserNavigationOrigin::Incidental,
-    );
-
-    assert_eq!(resolved.url, Some(parent_url));
-    assert_eq!(
-        resolved.write,
-        browser_url_resolution::BrowserHistoryWrite::None
-    );
-}
-
-#[test]
 fn resolve_browser_url_keeps_parent_conversation_view_when_focused_pane_has_no_link() {
     let parent_url = Url::parse(&format!(
         "{}/conversation/parent-token",
@@ -445,10 +418,14 @@ fn resolve_browser_url_keeps_parent_conversation_view_when_focused_pane_has_no_l
     let resolved = browser_url_resolution::resolve_browser_url(
         Some(parent_url.clone()),
         None,
-        browser_url_resolution::BrowserNavigationOrigin::Incidental,
+        browser_url_resolution::BrowserNavigationOrigin::RouteSync,
     );
 
     assert_eq!(resolved.url, Some(parent_url));
+    assert_eq!(
+        resolved.write,
+        browser_url_resolution::BrowserHistoryWrite::None
+    );
 }
 
 #[test]
@@ -463,7 +440,7 @@ fn resolve_browser_url_uses_requested_url_outside_the_viewer() {
     let resolved = browser_url_resolution::resolve_browser_url(
         Some(base_app_url),
         Some(requested_url.clone()),
-        browser_url_resolution::BrowserNavigationOrigin::Incidental,
+        browser_url_resolution::BrowserNavigationOrigin::RouteSync,
     );
 
     assert_eq!(resolved.url, Some(requested_url));
@@ -480,7 +457,7 @@ fn resolve_browser_url_falls_back_to_base_app_url_outside_the_viewer() {
     let resolved = browser_url_resolution::resolve_browser_url(
         Some(current_url),
         None,
-        browser_url_resolution::BrowserNavigationOrigin::Incidental,
+        browser_url_resolution::BrowserNavigationOrigin::RouteSync,
     );
 
     assert_eq!(
@@ -516,7 +493,7 @@ fn resolve_browser_url_returns_none_when_neither_url_is_known() {
     let resolved = browser_url_resolution::resolve_browser_url(
         None,
         None,
-        browser_url_resolution::BrowserNavigationOrigin::Incidental,
+        browser_url_resolution::BrowserNavigationOrigin::RouteSync,
     );
 
     assert_eq!(resolved.url, None);

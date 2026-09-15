@@ -916,14 +916,10 @@ struct FileUploadSessions {
 }
 #[cfg(any(target_family = "wasm", test))]
 fn take_matching_viewer_entry(
-    pending_view_id: &mut Option<EntityId>,
+    pending_view_ids: &mut HashSet<EntityId>,
     joined_view_id: EntityId,
 ) -> bool {
-    if *pending_view_id != Some(joined_view_id) {
-        return false;
-    }
-    pending_view_id.take();
-    true
+    pending_view_ids.remove(&joined_view_id)
 }
 
 /// Controls the color palette used for a workspace banner.
@@ -1062,7 +1058,10 @@ pub struct Workspace {
     window_id: WindowId,
     pub(crate) tabs: Vec<TabData>,
     active_tab_index: usize,
-    pending_viewer_entry_view_id: Option<EntityId>,
+    #[cfg(target_family = "wasm")]
+    pending_viewer_entry_view_ids: HashSet<EntityId>,
+    #[cfg(target_family = "wasm")]
+    pending_child_canonicalizations: HashMap<AmbientAgentTaskId, Url>,
     /// Tracks tab activation order (most-recently-used first).
     /// Each entry is the `pane_group.id()` of the corresponding tab.
     tab_mru_order: Vec<EntityId>,
@@ -2763,10 +2762,47 @@ impl Workspace {
         {
             return;
         }
+        let entry_task = AgentConversationsModel::handle(ctx).update(ctx, |model, ctx| {
+            model.get_or_async_fetch_task_data(&entry_task_id, ctx)
+        });
+        let Some(entry_task) = entry_task else {
+            self.pending_child_canonicalizations
+                .insert(entry_task_id, current_url);
+            return;
+        };
+        self.start_child_canonicalization(entry_task, current_url, ctx);
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn resume_pending_child_canonicalizations(&mut self, ctx: &mut ViewContext<Self>) {
+        let pending_task_ids = self
+            .pending_child_canonicalizations
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for task_id in pending_task_ids {
+            let Some(entry_task) = AgentConversationsModel::as_ref(ctx).get_task_data(&task_id)
+            else {
+                continue;
+            };
+            let Some(current_url) = self.pending_child_canonicalizations.remove(&task_id) else {
+                continue;
+            };
+            self.start_child_canonicalization(entry_task, current_url, ctx);
+        }
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn start_child_canonicalization(
+        &mut self,
+        entry_task: crate::ai::ambient_agents::AmbientAgentTask,
+        current_url: Url,
+        ctx: &mut ViewContext<Self>,
+    ) {
         let ai_client = ServerApiProvider::as_ref(ctx).get_ai_client();
         ctx.spawn(
             async move {
-                resolve_root_task(entry_task_id, |task_id| {
+                resolve_root_task(entry_task, |task_id| {
                     let ai_client = ai_client.clone();
                     async move { ai_client.get_ambient_agent_task(&task_id).await }
                 })
@@ -2774,6 +2810,9 @@ impl Workspace {
             },
             move |_workspace, result, _ctx| match result {
                 Ok(Some(resolution)) => {
+                    if parse_current_url().as_ref() != Some(&current_url) {
+                        return;
+                    }
                     if let Some(root_url) = canonical_root_url(&current_url, &resolution) {
                         update_browser_url_from_origin(
                             Some(root_url),
@@ -3369,8 +3408,11 @@ impl Workspace {
             |me, _, event, ctx| match event {
                 // Update transcript details if task or conversation data is updated
                 AgentConversationsModelEvent::NewTasksReceived
-                | AgentConversationsModelEvent::TasksUpdated
-                | AgentConversationsModelEvent::ConversationUpdated { .. }
+                | AgentConversationsModelEvent::TasksUpdated => {
+                    me.update_transcript_details_panel_data(ctx);
+                    me.resume_pending_child_canonicalizations(ctx);
+                }
+                AgentConversationsModelEvent::ConversationUpdated { .. }
                 | AgentConversationsModelEvent::ConversationArtifactsUpdated { .. } => {
                     me.update_transcript_details_panel_data(ctx);
                 }
@@ -3507,7 +3549,10 @@ impl Workspace {
         let mut ws = Self {
             tabs: Vec::new(),
             active_tab_index: 0,
-            pending_viewer_entry_view_id: None,
+            #[cfg(target_family = "wasm")]
+            pending_viewer_entry_view_ids: HashSet::new(),
+            #[cfg(target_family = "wasm")]
+            pending_child_canonicalizations: HashMap::new(),
             tab_mru_order: Vec::new(),
             hovered_tab_index: None,
             tab_bar_hover_state: Default::default(),
@@ -4497,11 +4542,17 @@ impl Workspace {
         ctx: &mut ViewContext<Self>,
     ) {
         self.add_tab_for_joining_shared_session(session_id, false, ctx);
-        self.pending_viewer_entry_view_id = self
-            .active_tab_pane_group()
-            .as_ref(ctx)
-            .active_session_view(ctx)
-            .map(|view| view.id());
+        #[cfg(target_family = "wasm")]
+        {
+            if let Some(view_id) = self
+                .active_tab_pane_group()
+                .as_ref(ctx)
+                .active_session_view(ctx)
+                .map(|view| view.id())
+            {
+                self.pending_viewer_entry_view_ids.insert(view_id);
+            }
+        }
     }
 
     /// Opens a cloud conversation by server token.
@@ -4739,7 +4790,7 @@ impl Workspace {
                 #[cfg(target_family = "wasm")]
                 ManagerEvent::JoinedSession { view_id, .. } => {
                     let is_viewer_entry =
-                        take_matching_viewer_entry(&mut me.pending_viewer_entry_view_id, *view_id);
+                        take_matching_viewer_entry(&mut me.pending_viewer_entry_view_ids, *view_id);
                     // Check if this session is in the current window and has an ambient agent task
                     let manager = Manager::as_ref(ctx);
                     if let Some(terminal_view) = manager.joined_view_by_id(view_id, ctx) {

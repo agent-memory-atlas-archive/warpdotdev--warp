@@ -9,10 +9,8 @@ const BASE_APP_PATH: &str = "/app";
 #[cfg(any(target_family = "wasm", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BrowserNavigationOrigin {
-    Incidental,
-    AutomaticRootRouteChange,
-    ChangedSelection,
-    BrowserHistory,
+    RouteSync,
+    AnchorSelection,
     InitialAnchorRestoration,
     #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
     InvalidAnchorCleanup,
@@ -42,42 +40,40 @@ pub(crate) fn resolve_browser_url(
     requested_url: Option<Url>,
     origin: BrowserNavigationOrigin,
 ) -> BrowserNavigation {
-    if origin == BrowserNavigationOrigin::BrowserHistory
-        || origin == BrowserNavigationOrigin::InitialAnchorRestoration
-    {
+    if origin == BrowserNavigationOrigin::InitialAnchorRestoration {
         return BrowserNavigation {
             url: current_url,
             write: BrowserHistoryWrite::None,
         };
     }
-
-    if origin == BrowserNavigationOrigin::Incidental
+    if origin == BrowserNavigationOrigin::RouteSync
         && let Some(current) = current_url.clone()
         && WebIntent::is_conversation_or_session_view(&current)
     {
+        let url = requested_url
+            .filter(WebIntent::is_conversation_or_session_view)
+            .map(|url| preserve_viewer_state(Some(&current), url))
+            .unwrap_or_else(|| current.clone());
         return BrowserNavigation {
-            url: Some(current),
-            write: BrowserHistoryWrite::None,
+            write: if url == current {
+                BrowserHistoryWrite::None
+            } else {
+                BrowserHistoryWrite::Replace
+            },
+            url: Some(url),
         };
     }
 
-    let url = if origin == BrowserNavigationOrigin::AutomaticRootRouteChange {
-        requested_url
-            .map(|url| preserve_viewer_state(current_url.as_ref(), url))
-            .or_else(|| base_app_url(current_url.clone()))
-    } else {
-        requested_url.or_else(|| base_app_url(current_url.clone()))
-    };
+    let url = requested_url.or_else(|| base_app_url(current_url.clone()));
     let write = match origin {
-        BrowserNavigationOrigin::Incidental => BrowserHistoryWrite::Replace,
-        BrowserNavigationOrigin::AutomaticRootRouteChange => {
+        BrowserNavigationOrigin::RouteSync => {
             if url == current_url {
                 BrowserHistoryWrite::None
             } else {
                 BrowserHistoryWrite::Replace
             }
         }
-        BrowserNavigationOrigin::ChangedSelection => {
+        BrowserNavigationOrigin::AnchorSelection => {
             if url == current_url {
                 BrowserHistoryWrite::None
             } else {
@@ -87,8 +83,7 @@ pub(crate) fn resolve_browser_url(
         BrowserNavigationOrigin::InvalidAnchorCleanup => BrowserHistoryWrite::Replace,
         BrowserNavigationOrigin::ColdChildCanonicalization => BrowserHistoryWrite::NavigateReplace,
         BrowserNavigationOrigin::Forced => BrowserHistoryWrite::Navigate,
-        BrowserNavigationOrigin::BrowserHistory
-        | BrowserNavigationOrigin::InitialAnchorRestoration => BrowserHistoryWrite::None,
+        BrowserNavigationOrigin::InitialAnchorRestoration => BrowserHistoryWrite::None,
     };
     BrowserNavigation { url, write }
 }

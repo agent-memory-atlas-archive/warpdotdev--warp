@@ -42,7 +42,8 @@ fn task(id: &str, parent: Option<&str>) -> AmbientAgentTask {
 #[test]
 fn parses_supported_viewer_state_without_changing_the_root_url() {
     let url = Url::parse(&format!(
-        "https://app.warp.dev/conversation/root?view=standalone&foo=bar#child={CHILD}"
+        "{}/conversation/root?view=standalone&foo=bar#child={CHILD}",
+        crate::ChannelState::server_root_url()
     ))
     .unwrap();
     let location = ViewerLocation::parse(&url).unwrap();
@@ -53,7 +54,10 @@ fn parses_supported_viewer_state_without_changing_the_root_url() {
     );
     assert_eq!(
         location.root_url.as_str(),
-        "https://app.warp.dev/conversation/root?view=standalone&foo=bar"
+        format!(
+            "{}/conversation/root?view=standalone&foo=bar",
+            crate::ChannelState::server_root_url()
+        )
     );
 }
 
@@ -61,13 +65,29 @@ fn parses_supported_viewer_state_without_changing_the_root_url() {
 fn standalone_value_and_child_key_are_case_sensitive() {
     let location = ViewerLocation::parse(
         &Url::parse(&format!(
-            "https://app.warp.dev/session/root?view=Standalone#Child={CHILD}"
+            "{}/session/{ROOT}?view=Standalone#Child={CHILD}",
+            crate::ChannelState::server_root_url()
         ))
         .unwrap(),
     )
     .unwrap();
     assert!(!location.standalone);
     assert_eq!(location.child_anchor, ChildAnchor::Root);
+}
+
+#[test]
+fn rejects_viewer_like_paths_with_extra_segments() {
+    for path in [
+        "/conversation/root/extra",
+        "/session/33333333-3333-3333-3333-333333333333/extra",
+    ] {
+        assert!(
+            ViewerLocation::parse(
+                &Url::parse(&format!("{}{path}", crate::ChannelState::server_root_url())).unwrap()
+            )
+            .is_none()
+        );
+    }
 }
 
 #[test]
@@ -79,7 +99,8 @@ fn empty_malformed_and_duplicate_child_anchors_are_invalid() {
     ] {
         let location = ViewerLocation::parse(
             &Url::parse(&format!(
-                "https://app.warp.dev/conversation/root#{fragment}"
+                "{}/conversation/root#{fragment}",
+                crate::ChannelState::server_root_url()
             ))
             .unwrap(),
         )
@@ -96,19 +117,24 @@ fn resolves_to_the_top_level_root_and_rejects_cycles() {
         (child_id, task(CHILD, Some(ROOT))),
         (root_id, task(ROOT, None)),
     ]);
-    let resolved = futures::executor::block_on(resolve_root_task(child_id, |id| {
+    let entry_task = tasks.remove(&child_id).unwrap();
+    let mut fetched_task_ids = Vec::new();
+    let resolved = futures::executor::block_on(resolve_root_task(entry_task, |id| {
+        fetched_task_ids.push(id);
         futures::future::ready(tasks.remove(&id).ok_or_else(|| anyhow!("missing")))
     }))
     .unwrap()
     .unwrap();
     assert_eq!(resolved.root_task.task_id, root_id);
     assert_eq!(resolved.entry_task_id, child_id);
+    assert_eq!(fetched_task_ids, vec![root_id]);
 
     let mut cycle = HashMap::from([
         (child_id, task(CHILD, Some(ROOT))),
         (root_id, task(ROOT, Some(CHILD))),
     ]);
-    let result = futures::executor::block_on(resolve_root_task(child_id, |id| {
+    let entry_task = cycle.remove(&child_id).unwrap();
+    let result = futures::executor::block_on(resolve_root_task(entry_task, |id| {
         futures::future::ready(cycle.remove(&id).ok_or_else(|| anyhow!("missing")))
     }));
     assert!(result.is_err());
@@ -125,7 +151,8 @@ fn deep_walk_returns_only_the_top_level_root() {
         (middle_id, task(middle, Some(ROOT))),
         (root_id, task(ROOT, None)),
     ]);
-    let resolved = futures::executor::block_on(resolve_root_task(child_id, |id| {
+    let entry_task = tasks.remove(&child_id).unwrap();
+    let resolved = futures::executor::block_on(resolve_root_task(entry_task, |id| {
         futures::future::ready(tasks.remove(&id).ok_or_else(|| anyhow!("missing")))
     }))
     .unwrap()
@@ -136,9 +163,8 @@ fn deep_walk_returns_only_the_top_level_root() {
 
 #[test]
 fn top_level_entry_is_not_canonicalized_as_a_child() {
-    let root_id = ROOT.parse().unwrap();
-    let resolved = futures::executor::block_on(resolve_root_task(root_id, |_| {
-        futures::future::ready(Ok(task(ROOT, None)))
+    let resolved = futures::executor::block_on(resolve_root_task(task(ROOT, None), |_| {
+        futures::future::ready(Err(anyhow!("root entries do not fetch a parent")))
     }))
     .unwrap();
     assert!(resolved.is_none());
@@ -229,13 +255,13 @@ fn anchor_waits_for_registration_after_seed_and_clears_unmatched_values() {
 
 #[test]
 fn resolver_rejects_response_mismatches_fetch_failures_and_depth_overflow() {
-    let child_id = CHILD.parse().unwrap();
-    let mismatched = futures::executor::block_on(resolve_root_task(child_id, |_| {
-        futures::future::ready(Ok(task(ROOT, None)))
-    }));
+    let mismatched =
+        futures::executor::block_on(resolve_root_task(task(CHILD, Some(ROOT)), |_| {
+            futures::future::ready(Ok(task(CHILD, None)))
+        }));
     assert!(mismatched.is_err());
 
-    let failed = futures::executor::block_on(resolve_root_task(child_id, |_| {
+    let failed = futures::executor::block_on(resolve_root_task(task(CHILD, Some(ROOT)), |_| {
         futures::future::ready(Err(anyhow!("unauthorized")))
     }));
     assert!(failed.is_err());
@@ -253,7 +279,8 @@ fn resolver_rejects_response_mismatches_fetch_failures_and_depth_overflow() {
         let parent = ids.get(index + 1).map(ToString::to_string);
         tasks.insert(*task_id, task(&task_id.to_string(), parent.as_deref()));
     }
-    let overflow = futures::executor::block_on(resolve_root_task(ids[0], |id| {
+    let entry_task = tasks.remove(&ids[0]).unwrap();
+    let overflow = futures::executor::block_on(resolve_root_task(entry_task, |id| {
         futures::future::ready(tasks.remove(&id).ok_or_else(|| anyhow!("missing")))
     }));
     assert!(overflow.is_err());

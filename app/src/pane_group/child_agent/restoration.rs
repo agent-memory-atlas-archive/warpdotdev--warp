@@ -37,7 +37,9 @@ use crate::uri::browser_url_handler::{parse_current_url, update_viewer_selection
 #[cfg(target_family = "wasm")]
 use crate::uri::browser_url_resolution::BrowserNavigationOrigin;
 #[cfg(target_family = "wasm")]
-use crate::uri::viewer_location::{HydratedAnchorAction, ViewerLocation, hydrated_anchor_action};
+use crate::uri::viewer_location::{
+    ChildAnchor, HydratedAnchorAction, ViewerLocation, hydrated_anchor_action,
+};
 
 /// Max direct children fetched per ancestor-list restore seed. The server
 /// caps at 100 regardless, matching the Observer-side ancestor seed fetch.
@@ -367,6 +369,16 @@ impl PaneGroup {
         let Some(location) = parse_current_url().as_ref().and_then(ViewerLocation::parse) else {
             return;
         };
+        let Some(parent_pane_id) = self.pane_id_for_owned_conversation(parent_conversation_id, ctx)
+        else {
+            return;
+        };
+        let Some(terminal_surface_id) = self
+            .terminal_view_from_pane_id(parent_pane_id, ctx)
+            .map(|view| view.id())
+        else {
+            return;
+        };
         let seeded_child_ids: HashSet<AmbientAgentTaskId> = children
             .iter()
             .filter(|task| task.task_id != parent_task_id)
@@ -387,9 +399,33 @@ impl PaneGroup {
             &registered_child_ids,
         ) {
             HydratedAnchorAction::None => return,
-            HydratedAnchorAction::Clear | HydratedAnchorAction::Wait => {
+            HydratedAnchorAction::Clear => {
                 update_viewer_selection(None, BrowserNavigationOrigin::InvalidAnchorCleanup);
                 return;
+            }
+            HydratedAnchorAction::Wait => {
+                let ChildAnchor::Selected(task_id) = location.child_anchor else {
+                    return;
+                };
+                let Some(child_task) = children.iter().find(|task| task.task_id == task_id) else {
+                    update_viewer_selection(None, BrowserNavigationOrigin::InvalidAnchorCleanup);
+                    return;
+                };
+                let name = child_task.display_name().to_string();
+                let fallback_title = child_task.title.trim().to_string();
+                let harness = agent_task_harness(child_task);
+                BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
+                    history.ensure_remote_child_conversation(
+                        terminal_surface_id,
+                        parent_conversation_id,
+                        child_task.task_id.to_string(),
+                        child_task.task_id,
+                        name,
+                        fallback_title,
+                        harness,
+                        ctx,
+                    )
+                })
             }
             HydratedAnchorAction::Select(task_id) => {
                 let Some(conversation_id) = BlocklistAIHistoryModel::as_ref(ctx)
@@ -400,10 +436,6 @@ impl PaneGroup {
                 };
                 conversation_id
             }
-        };
-        let Some(parent_pane_id) = self.pane_id_for_owned_conversation(parent_conversation_id, ctx)
-        else {
-            return;
         };
         if self.ensure_hidden_child_agent_pane_for_conversation(conversation_id, ctx) {
             self.swap_active_pane_to_conversation_with_origin(

@@ -261,12 +261,7 @@ impl OrchestrationViewerModel {
                 parent_task_id,
                 child_run_ids,
             } if *parent_task_id == self.parent_task_id => {
-                self.seeded_child_ids = Some(
-                    child_run_ids
-                        .iter()
-                        .filter_map(|run_id| run_id.parse().ok())
-                        .collect(),
-                );
+                self.seeded_child_ids = Some(child_run_ids.iter().copied().collect());
                 self.maybe_resolve_initial_child_anchor(ctx);
             }
             // Other orchestrators (or non-viewer-mode variants) are ignored.

@@ -12,6 +12,8 @@ use url::{Url, form_urlencoded};
 use crate::ai::ambient_agents::{
     AmbientAgentLiveSessionState, AmbientAgentTask, AmbientAgentTaskId,
 };
+#[cfg(any(target_family = "wasm", test))]
+use crate::uri::web_intent_parser::WebIntent;
 
 #[cfg(any(target_family = "wasm", test))]
 pub(crate) const MAX_PARENT_EDGES: usize = 64;
@@ -63,10 +65,7 @@ pub(crate) struct ViewerLocation {
 #[cfg(any(target_family = "wasm", test))]
 impl ViewerLocation {
     pub(crate) fn parse(url: &Url) -> Option<Self> {
-        if !matches!(
-            url.path_segments()?.next(),
-            Some("conversation" | "session")
-        ) {
+        if !WebIntent::is_conversation_or_session_view(url) {
             return None;
         }
 
@@ -119,27 +118,25 @@ pub(crate) struct RootResolution {
 
 #[cfg(any(target_family = "wasm", test))]
 pub(crate) async fn resolve_root_task<F, Fut>(
-    entry_task_id: AmbientAgentTaskId,
+    entry_task: AmbientAgentTask,
     mut fetch: F,
 ) -> Result<Option<RootResolution>>
 where
     F: FnMut(AmbientAgentTaskId) -> Fut,
     Fut: Future<Output = Result<AmbientAgentTask>>,
 {
+    let entry_task_id = entry_task.task_id;
     let mut visited = HashSet::from([entry_task_id]);
-    let mut current_task_id = entry_task_id;
+    let mut current_task = entry_task;
     let mut parent_edges = 0;
 
     loop {
-        let task = fetch(current_task_id).await?;
-        if task.task_id != current_task_id {
-            return Err(anyhow!("run response did not match requested run id"));
-        }
-        let Some(parent_run_id) = task.parent_run_id.as_deref() else {
+        let current_task_id = current_task.task_id;
+        let Some(parent_run_id) = current_task.parent_run_id.as_deref() else {
             return Ok(
                 (current_task_id != entry_task_id).then_some(RootResolution {
                     entry_task_id,
-                    root_task: task,
+                    root_task: current_task,
                 }),
             );
         };
@@ -154,7 +151,10 @@ where
         if !visited.insert(parent_task_id) {
             return Err(anyhow!("cycle in run ancestry"));
         }
-        current_task_id = parent_task_id;
+        current_task = fetch(parent_task_id).await?;
+        if current_task.task_id != parent_task_id {
+            return Err(anyhow!("run response did not match requested run id"));
+        }
         parent_edges += 1;
     }
 }

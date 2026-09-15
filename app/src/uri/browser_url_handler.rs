@@ -31,7 +31,7 @@ pub fn update_browser_url(url: Option<Url>, force_redirect: bool) {
     let origin = if force_redirect {
         BrowserNavigationOrigin::Forced
     } else {
-        BrowserNavigationOrigin::Incidental
+        BrowserNavigationOrigin::RouteSync
     };
     update_browser_url_from_origin(url, origin);
 }

@@ -7064,15 +7064,21 @@ impl PaneGroup {
         log::debug!("Url for pane should be updated pane_id: {pane_id:?}, url: {url:?}");
         #[cfg(target_family = "wasm")]
         if pane_id == self.focused_pane_id(ctx) {
-            let origin = if self.child_agent_panes.values().any(|id| *id == pane_id) {
-                BrowserNavigationOrigin::Incidental
-            } else {
-                BrowserNavigationOrigin::AutomaticRootRouteChange
-            };
-            update_browser_url_from_origin(url, origin);
+            update_browser_url_from_origin(
+                self.browser_route_sync_url(pane_id, url),
+                BrowserNavigationOrigin::RouteSync,
+            );
         }
 
         let _ = ctx;
+    }
+    #[cfg(any(target_family = "wasm", test))]
+    fn browser_route_sync_url(&self, pane_id: PaneId, url: Option<Url>) -> Option<Url> {
+        if self.child_agent_panes.values().any(|id| *id == pane_id) {
+            None
+        } else {
+            url
+        }
     }
 
     #[cfg(target_family = "wasm")]
@@ -7084,21 +7090,18 @@ impl PaneGroup {
         ctx.spawn(initial_load_complete, move |me, _, ctx| {
             if let Some(pane) = me.focused_pane_content(ctx) {
                 let focused_pane_id = me.focused_pane_id(ctx);
-                let origin = if me
-                    .child_agent_panes
-                    .values()
-                    .any(|id| *id == focused_pane_id)
-                {
-                    BrowserNavigationOrigin::Incidental
-                } else {
-                    BrowserNavigationOrigin::AutomaticRootRouteChange
-                };
                 match pane.shareable_link(ctx) {
                     Ok(crate::pane_group::pane::ShareableLink::Base) => {
-                        update_browser_url_from_origin(None, origin)
+                        update_browser_url_from_origin(
+                            me.browser_route_sync_url(focused_pane_id, None),
+                            BrowserNavigationOrigin::RouteSync,
+                        )
                     }
                     Ok(crate::pane_group::pane::ShareableLink::Pane { url }) => {
-                        update_browser_url_from_origin(Some(url), origin)
+                        update_browser_url_from_origin(
+                            me.browser_route_sync_url(focused_pane_id, Some(url)),
+                            BrowserNavigationOrigin::RouteSync,
+                        )
                     }
                     Err(crate::pane_group::pane::ShareableLinkError::Expected) => {}
                     Err(crate::pane_group::pane::ShareableLinkError::Unexpected(message)) => {
@@ -7298,7 +7301,7 @@ impl PaneGroup {
         ctx: &mut ViewContext<Self>,
     ) {
         #[cfg(target_family = "wasm")]
-        let origin = crate::uri::browser_url_resolution::BrowserNavigationOrigin::ChangedSelection;
+        let origin = crate::uri::browser_url_resolution::BrowserNavigationOrigin::AnchorSelection;
         #[cfg(not(target_family = "wasm"))]
         let origin = ();
         self.swap_active_pane_to_conversation_with_origin(

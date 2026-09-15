@@ -28,14 +28,15 @@ Implement the following steps in order on one branch. Do not release or enable c
 
 #### 1. Replace the Phase 0 guard
 Replace the forced/non-forced boolean decision with an explicit navigation origin. The URL layer must distinguish:
-- incidental focus, transcript hydration, and session events;
+- route synchronization from focus, transcript hydration, and session events;
 - changed user selection;
-- browser history;
 - initial anchored restoration;
 - cold child canonicalization;
 - forced navigation such as login.
 
 Preserve the shipped invariant that incidental events cannot replace the root path with a child path. Allow explicit anchor changes and cold canonicalization. Rewrite the Phase 0 tests around these origins before adding new URL behavior.
+
+Browser Back and Forward already re-enter the current viewer route through the `popstate` reload listener, so they bypass the URL writer rather than using a synthetic navigation origin.
 
 #### 2. Parse viewer location state
 Parse the raw browser URL separately from `WebIntent`:
@@ -59,7 +60,7 @@ Skip this step in standalone mode. Otherwise obtain the entry task ID from the l
 
 If the route has no task ID, keep the existing standalone viewer.
 
-Use `get_ambient_agent_task` for the entry run and each parent. Record the entry run ID, fetch the current run, and follow `parent_run_id` until a run has no parent. Track visited IDs and allow at most 64 parent edges.
+Obtain the entry run through `AgentConversationsModel` so concurrent route and details-panel loads share its deduplicated request. Then use `get_ambient_agent_task` for each parent and follow `parent_run_id` until a run has no parent. Track visited IDs and allow at most 64 parent edges.
 
 Abort on an invalid ID, cycle, missing or unauthorized run, transport failure, or depth overflow. Discard the partial chain and keep the original child viewer. Never redirect to an intermediate ancestor.
 
@@ -79,7 +80,7 @@ Preserve `view=standalone` across same-run session/conversation redirects. Unkno
 #### 6. Add selection history
 - A changed user child selection pushes the root URL with `#child=<run-id>`.
 - A user root selection or in-view back action pushes the unanchored root URL.
-- Browser Back and Forward apply selection without writing history.
+- Browser Back and Forward reload the prior viewer URL, whose initial restoration applies selection without writing history.
 - Repeated selection, initial restoration, generic focus, transcript hydration, and session events do not write history.
 - Automatic changes between the root’s session and conversation routes preserve the current child anchor.
 
