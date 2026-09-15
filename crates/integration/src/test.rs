@@ -162,6 +162,7 @@ use warp::integration_testing::window::{
 use warp::integration_testing::workspace::assert_tab_count;
 use warp::integration_testing::{self, view_of_type};
 use warp::pane_group::AGENT_MODE_PANE_DEFAULT_MINIMUM_WIDTH;
+use warp::pane_group::pane::PaneView;
 use warp::settings::{
     CompletionsOpenWhileTyping, CtrlTabBehavior, INPUT_MODE, MonospaceFontSize,
     NativeShellCompletionsEnabled, TabBehavior,
@@ -199,7 +200,8 @@ use warpui_core::platform::{OperatingSystem, TerminationMode};
 use warpui_core::units::Lines;
 use warpui_core::windowing::WindowManager;
 use warpui_core::{
-    AssetProvider, Event, SingletonEntity, UpdateView, ViewHandle, async_assert, async_assert_eq,
+    AssetProvider, Event, SingletonEntity, TypedActionView, UpdateView, ViewHandle, async_assert,
+    async_assert_eq,
 };
 pub use websockets::*;
 pub use workflows::*;
@@ -475,7 +477,31 @@ pub fn test_open_and_close_settings() -> Builder {
         .with_step(wait_until_bootstrapped_single_pane_for_tab(0))
         .with_step(
             new_step_with_default_assertions("Open settings tab")
-                .with_keystrokes(&["cmdorctrl-,"])
+                .with_action(|app, window_id, _| {
+                    let workspace = workspace_view(app, window_id);
+                    workspace.update(app, |workspace, ctx| {
+                        workspace.handle_action(
+                            &WorkspaceAction::ScrollToSettingsWidget {
+                                page: SettingsSection::Appearance,
+                                widget_id: SettingsView::input_mode_widget_id(),
+                            },
+                            ctx,
+                        );
+                        let settings_view = ctx
+                            .views_of_type::<SettingsView>(window_id)
+                            .and_then(|views| views.first().cloned())
+                            .expect("Settings view must exist");
+                        let pane_view = ctx
+                            .views_of_type::<PaneView<SettingsView>>(window_id)
+                            .and_then(|views| views.first().cloned())
+                            .expect("Settings pane view must exist");
+                        assert!(
+                            ctx.view_ancestors(window_id, settings_view.id())
+                                .contains(&pane_view.id()),
+                            "Settings view must be parented to its pane before rendering"
+                        );
+                    });
+                })
                 .add_assertion(assert_tab_count(2))
                 .add_assertion(assert_tab_title(1, "Settings"))
                 .add_assertion(assert_pane_title(1, 0, "Settings"))
@@ -489,15 +515,27 @@ pub fn test_open_and_close_settings() -> Builder {
                     settings_view.read(app, |view, _| {
                         async_assert_eq!(
                             view.current_settings_section(),
-                            SettingsSection::default()
+                            SettingsSection::Appearance
                         )
                     })
                 }),
         )
         .with_step(
-            new_step_with_default_assertions("Close the settings tab with close tab button")
-                .with_hover_over_saved_position("close_tab_button:1")
-                .with_click_on_saved_position("close_tab_button:1")
+            new_step_with_default_assertions("Open the input position dropdown")
+                .with_click_on_saved_position_fn(|app, window_id| {
+                    view_of_type::<SettingsView>(app, window_id, 0)
+                        .read(app, |view, ctx| view.input_mode_dropdown_position_id(ctx))
+                }),
+        )
+        .with_step(
+            new_step_with_default_assertions("Select Classic input position")
+                .with_click_on_saved_position("Start at the top (Classic mode)"),
+        )
+        .with_step(
+            new_step_with_default_assertions("Close the settings tab with Close Current Session")
+                .with_action(|app, window_id, _| {
+                    app.dispatch_custom_action(CustomAction::CloseCurrentSession, window_id);
+                })
                 .add_assertion(assert_tab_count(1))
                 .add_assertion(assert_tab_title(0, "~")),
         )

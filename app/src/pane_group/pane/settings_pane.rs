@@ -62,13 +62,15 @@ impl PaneContent for SettingsPane {
         ctx: &mut ViewContext<PaneGroup>,
     ) {
         let pane_id = self.id();
+        let settings_view = self.settings_view(ctx);
+        let window_id = ctx.window_id();
+        ctx.record_view_parent(window_id, settings_view.id(), self.view.id());
         self.view
             .update(ctx, |view, ctx| view.set_focus_handle(focus_handle, ctx));
 
-        ctx.subscribe_to_view(
-            &self.settings_view(ctx),
-            move |pane_group, _, event, ctx| handle_settings_event(pane_group, pane_id, event, ctx),
-        );
+        ctx.subscribe_to_view(&settings_view, move |pane_group, _, event, ctx| {
+            handle_settings_event(pane_group, pane_id, event, ctx)
+        });
 
         ctx.subscribe_to_view(&self.view, move |group, _, event, ctx| {
             group.handle_pane_view_event(pane_id, event, ctx);
