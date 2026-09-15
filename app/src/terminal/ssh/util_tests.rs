@@ -65,6 +65,7 @@ fn ssh_namespace_cloud_parsing() {
     assert!(parse_interactive_ssh_command("nsc sshfoo").is_none());
     assert!(parse_interactive_ssh_command("nscssh").is_none());
     assert!(parse_interactive_ssh_command("nsc list").is_none());
+    assert!(parse_interactive_ssh_command("nsc ssh \"unterminated").is_none());
 
     let bare_command = parse_interactive_ssh_command("nsc ssh").unwrap();
     assert!(bare_command.host.is_none());
@@ -91,6 +92,9 @@ fn ssh_namespace_cloud_parsing() {
 
     assert!(parse_interactive_ssh_command("nsc ssh -T 85a32emcg99ii").is_none());
     assert!(parse_interactive_ssh_command("nsc ssh --disable-pty 85a32emcg99ii").is_none());
+    assert!(parse_interactive_ssh_command("nsc ssh --disable-pty=true 85a32emcg99ii").is_none());
+    assert!(parse_interactive_ssh_command("nsc ssh --disable-pty=1 85a32emcg99ii").is_none());
+    assert!(parse_interactive_ssh_command("nsc ssh --disable-pty=false 85a32emcg99ii").is_some());
     assert!(parse_interactive_ssh_command("nsc ssh 85a32emcg99ii ls /").is_none());
     assert!(parse_interactive_ssh_command("nsc ssh --container_name").is_none());
     assert!(parse_interactive_ssh_command("nsc ssh --container_name --oneshot").is_none());
