@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use chrono::Local;
@@ -34,14 +34,12 @@ use warpui::{App, SingletonEntity as _};
 
 use super::{
     AgentDriver, AgentDriverError, AgentRunPrompt, CLIAgentSessionStatus, IdleTimeoutSender,
-    InterruptFlags, InterruptSignal, LEGACY_OZ_PARENT_LISTENER_MANAGED_EXTERNALLY_ENV,
+    InterruptSignal, LEGACY_OZ_PARENT_LISTENER_MANAGED_EXTERNALLY_ENV,
     LEGACY_OZ_PARENT_STATE_ROOT_ENV, MANAGED_MCP_RESOLVE_MAX_ATTEMPTS,
     OZ_MESSAGE_LISTENER_MANAGED_EXTERNALLY_ENV, OZ_MESSAGE_LISTENER_STATE_ROOT_ENV,
-    PlatformErrorCode, RunEndCause, SDKConversationOutputStatus,
-    WARP_MESSAGE_LISTENER_STATE_ROOT_ENV, build_secret_env_vars,
-    idle_window_for_cli_session_status, idle_window_for_terminal_status, run_end_cause,
-    select_run_outcome, setup_failure_status_update, should_attempt_handoff_snapshot,
-    terminal_status_log_outcome,
+    PlatformErrorCode, SDKConversationOutputStatus, WARP_MESSAGE_LISTENER_STATE_ROOT_ENV,
+    build_secret_env_vars, idle_window_for_cli_session_status, idle_window_for_terminal_status,
+    setup_failure_status_update, should_attempt_handoff_snapshot, terminal_status_log_outcome,
 };
 use crate::ai::agent::conversation::ConversationStatus;
 use crate::ai::agent::task::TaskId;
@@ -2747,56 +2745,6 @@ fn openai_api_key_exports_only_api_key_not_base_url() {
     );
 }
 
-fn recorded_interrupt_flags(term: bool, int: bool) -> InterruptFlags {
-    InterruptFlags {
-        term: Arc::new(AtomicBool::new(term)),
-        int: Arc::new(AtomicBool::new(int)),
-    }
-}
-
-#[test]
-fn recorded_sigterm_wins_when_run_and_deadline_are_also_ready() {
-    let flags = recorded_interrupt_flags(true, false);
-    let selected = block_on(select_run_outcome(
-        std::future::ready(Ok(())),
-        std::future::ready(()),
-        std::future::pending::<InterruptSignal>(),
-        Some(&flags),
-        false,
-    ));
-    assert_eq!(
-        run_end_cause(&selected),
-        RunEndCause::Signal(InterruptSignal::Term)
-    );
-}
-
-#[test]
-fn select_biased_prefers_ready_sigint_over_ready_run() {
-    let selected = block_on(select_run_outcome(
-        std::future::ready(Ok(())),
-        std::future::pending::<()>(),
-        std::future::ready(InterruptSignal::Int),
-        None,
-        false,
-    ));
-    assert_eq!(
-        run_end_cause(&selected),
-        RunEndCause::Signal(InterruptSignal::Int)
-    );
-}
-
-#[test]
-fn deadline_timer_is_selected_when_no_interrupt_is_recorded() {
-    let selected = block_on(select_run_outcome(
-        std::future::pending::<Result<(), AgentDriverError>>(),
-        std::future::ready(()),
-        std::future::pending::<InterruptSignal>(),
-        None,
-        false,
-    ));
-    assert_eq!(run_end_cause(&selected), RunEndCause::SandboxDeadline);
-}
-
 #[test]
 fn handoff_snapshot_is_skipped_when_oz_handoff_is_disabled() {
     assert!(!should_attempt_handoff_snapshot(false, true, false));
@@ -2810,25 +2758,6 @@ fn handoff_snapshot_is_skipped_without_a_task_id() {
 #[test]
 fn handoff_snapshot_is_skipped_when_no_snapshot_is_set() {
     assert!(!should_attempt_handoff_snapshot(true, true, true));
-}
-
-#[cfg(unix)]
-#[test]
-fn unregistering_interrupt_watch_stops_the_fallback_waiter() {
-    let flags = recorded_interrupt_flags(false, false);
-    let closed = Arc::new(AtomicBool::new(false));
-    let (tx, rx) = oneshot::channel();
-    let waiter = super::spawn_poll_interrupt_waiter(flags, tx, Arc::clone(&closed));
-    super::InterruptWatch {
-        sig_ids: Vec::new(),
-        closed,
-        waiter,
-    }
-    .unregister();
-    assert!(
-        block_on(rx).is_err(),
-        "fallback waiter should exit without delivering a signal"
-    );
 }
 
 #[cfg(unix)]
@@ -2852,17 +2781,12 @@ fn signal_lifecycle_child() -> ! {
     };
     let ready_path = std::env::var(SIGNAL_READY_ENV).unwrap();
 
-    let (signal_fut, flags, _watch) = super::watch_interrupt_signals();
+    let (signal_fut, flags, _watch) = super::watch_interrupt_signals().expect("signal watch");
     fs::write(&ready_path, b"ready").unwrap();
 
-    let selected = block_on(select_run_outcome(
-        std::future::pending::<Result<(), AgentDriverError>>(),
-        std::future::pending::<()>(),
-        signal_fut,
-        Some(&flags),
-        false,
-    ));
-    assert_eq!(run_end_cause(&selected), RunEndCause::Signal(expected));
+    let signal = block_on(signal_fut);
+    assert_eq!(signal, expected);
+    assert_eq!(flags.pending(), Some(expected));
 
     if kind == "int-hang" {
         let log_path = std::env::var(SIGNAL_LOG_ENV).unwrap();
@@ -2874,9 +2798,6 @@ fn signal_lifecycle_child() -> ! {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
-    let RunEndCause::Signal(signal) = run_end_cause(&selected) else {
-        std::process::exit(1);
-    };
     super::emulate_default_and_exit(signal);
 }
 
