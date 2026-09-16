@@ -134,15 +134,9 @@ impl BrowserInitialChildAnchorRouter {
                 self.initial_anchor_resolution_emitted = true;
                 return;
             }
-            HydratedAnchorAction::Wait => {
-                let ChildAnchor::Selected(task_id) = self.initial_child_anchor else {
-                    return;
-                };
-                self.fetch_initial_anchor_task(task_id, false, ctx);
-                return;
-            }
+            HydratedAnchorAction::Wait => return,
             HydratedAnchorAction::FetchAndVerify(task_id) => {
-                self.fetch_initial_anchor_task(task_id, true, ctx);
+                self.fetch_initial_anchor_task(task_id, ctx);
                 return;
             }
             HydratedAnchorAction::Clear => None,
@@ -154,7 +148,6 @@ impl BrowserInitialChildAnchorRouter {
     fn fetch_initial_anchor_task(
         &mut self,
         task_id: AmbientAgentTaskId,
-        verify_parent: bool,
         ctx: &mut ModelContext<Self>,
     ) {
         if self.initial_anchor_fetch_in_flight {
@@ -171,8 +164,7 @@ impl BrowserInitialChildAnchorRouter {
                 match result {
                     Ok(task)
                         if task.task_id == task_id
-                            && (!verify_parent
-                                || is_expected_direct_child(&task, task_id, parent_task_id)) =>
+                            && is_expected_direct_child(&task, task_id, parent_task_id) =>
                     {
                         orchestration_viewer_model.update(ctx, |model, ctx| {
                             model.register_child(task, ctx);
@@ -191,6 +183,9 @@ impl BrowserInitialChildAnchorRouter {
         conversation_id: Option<AIConversationId>,
         ctx: &mut ModelContext<Self>,
     ) {
+        if self.initial_anchor_resolution_emitted {
+            return;
+        }
         self.initial_anchor_resolution_emitted = true;
         if let Some(view) = self.terminal_view.upgrade(ctx) {
             view.update(ctx, |_view, ctx| {

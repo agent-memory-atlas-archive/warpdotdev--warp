@@ -16,7 +16,7 @@ const CHILD_TASK_ID: &str = "22222222-2222-2222-2222-222222222222";
 const OTHER_PARENT_TASK_ID: &str = "33333333-3333-3333-3333-333333333333";
 
 #[test]
-fn restores_a_seeded_child_when_discovery_registers_it() {
+fn waits_for_seeded_child_registration_and_ignores_stale_completion() {
     let _unified_stack = FeatureFlag::OrchestrationUnifiedStack.override_enabled(true);
     App::test((), |mut app| async move {
         let (terminal_view, viewer_model, router) =
@@ -24,7 +24,6 @@ fn restores_a_seeded_child_when_discovery_registers_it() {
         let restored = observe_restorations(&mut app, &terminal_view);
 
         router.update(&mut app, |router, ctx| {
-            router.initial_anchor_fetch_in_flight = true;
             router.handle_streamer_event(
                 &OrchestrationEventStreamerEvent::ViewerModeSeeded {
                     parent_task_id: task_id(PARENT_TASK_ID),
@@ -33,12 +32,20 @@ fn restores_a_seeded_child_when_discovery_registers_it() {
                 ctx,
             );
         });
+        router.read(&app, |router, _| {
+            assert!(!router.initial_anchor_fetch_in_flight);
+        });
+        assert!(restored.lock().is_empty());
         viewer_model.update(&mut app, |model, ctx| {
             model.register_child(child_task(), ctx);
         });
 
         let child_conversation_id = viewer_model.read(&app, |model, _| {
             model.registered_children()[&task_id(CHILD_TASK_ID)]
+        });
+
+        router.update(&mut app, |router, ctx| {
+            router.finish_initial_anchor_resolution(None, ctx);
         });
         assert_eq!(*restored.lock(), vec![Some(child_conversation_id)]);
     });
