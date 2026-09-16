@@ -29,13 +29,6 @@ use crate::features::FeatureFlag;
 use crate::pane_group::{ChildPaneMaterialization, decide_child_pane_materialization};
 use crate::server::server_api::ServerApiProvider;
 use crate::terminal::{Event as TerminalViewEvent, TerminalView};
-#[cfg(target_family = "wasm")]
-use crate::uri::browser_url_handler::parse_current_url;
-#[cfg(target_family = "wasm")]
-use crate::uri::viewer_location::{
-    ChildAnchor, HydratedAnchorAction, ViewerLocation, hydrated_anchor_action,
-    is_expected_direct_child,
-};
 
 /// Refetch cadence for children whose claim-time `session_id` is not yet known.
 const PENDING_SESSION_ID_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -54,7 +47,7 @@ struct ChildAgentEntry {
 
 /// Owns child discovery + status tracking for a shared session viewer of
 /// an orchestrated session.
-pub struct OrchestrationViewerModel {
+pub(crate) struct OrchestrationViewerModel {
     parent_task_id: AmbientAgentTaskId,
     terminal_view_id: EntityId,
     terminal_view: WeakViewHandle<TerminalView>,
@@ -74,20 +67,22 @@ pub struct OrchestrationViewerModel {
     /// Periodic timer fetching the claim-time `session_id` for
     /// not-yet-claimed children.
     pending_session_id_poll_handle: Option<SpawnedFutureHandle>,
-    #[cfg(target_family = "wasm")]
-    initial_child_anchor: ChildAnchor,
-    #[cfg(target_family = "wasm")]
-    seeded_child_ids: Option<HashSet<AmbientAgentTaskId>>,
-    #[cfg(target_family = "wasm")]
-    initial_anchor_resolution_emitted: bool,
-    #[cfg(target_family = "wasm")]
-    initial_anchor_fetch_in_flight: bool,
     /// Test-only: counts `spawn_task_metadata_fetch` invocations.
     #[cfg(test)]
     metadata_fetch_dispatch_count: usize,
 }
+#[cfg(any(target_family = "wasm", test))]
+pub(crate) enum OrchestrationViewerModelEvent {
+    ChildRegistered {
+        task_id: AmbientAgentTaskId,
+        conversation_id: AIConversationId,
+    },
+}
 
 impl Entity for OrchestrationViewerModel {
+    #[cfg(any(target_family = "wasm", test))]
+    type Event = OrchestrationViewerModelEvent;
+    #[cfg(not(any(target_family = "wasm", test)))]
     type Event = ();
 }
 
@@ -95,6 +90,14 @@ impl OrchestrationViewerModel {
     /// Returns the orchestrator's `AmbientAgentTaskId`.
     pub fn parent_task_id(&self) -> AmbientAgentTaskId {
         self.parent_task_id
+    }
+
+    #[cfg(any(target_family = "wasm", test))]
+    pub(super) fn registered_children(&self) -> HashMap<AmbientAgentTaskId, AIConversationId> {
+        self.children
+            .iter()
+            .map(|(task_id, entry)| (*task_id, entry.conversation_id))
+            .collect()
     }
     /// Builds a viewer model attached to the given parent shared session.
     pub fn new(
@@ -141,18 +144,6 @@ impl OrchestrationViewerModel {
             metadata_fetches: HashSet::new(),
             pending_task_ids_for_discovery: HashSet::new(),
             pending_session_id_poll_handle: None,
-            #[cfg(target_family = "wasm")]
-            initial_child_anchor: parse_current_url()
-                .as_ref()
-                .and_then(ViewerLocation::parse)
-                .map(|location| location.child_anchor)
-                .unwrap_or(ChildAnchor::Root),
-            #[cfg(target_family = "wasm")]
-            seeded_child_ids: None,
-            #[cfg(target_family = "wasm")]
-            initial_anchor_resolution_emitted: false,
-            #[cfg(target_family = "wasm")]
-            initial_anchor_fetch_in_flight: false,
             #[cfg(test)]
             metadata_fetch_dispatch_count: 0,
         };
@@ -191,7 +182,7 @@ impl OrchestrationViewerModel {
     /// `is_viewing_shared_session() && parent_conversation_id().is_none()`).
     /// Defers if the placeholder hasn't been stamped yet; re-runs from
     /// history events that may flip the placeholder state.
-    fn register_viewer_mode_consumer_if_possible(&self, ctx: &mut ModelContext<Self>) {
+    pub(super) fn register_viewer_mode_consumer_if_possible(&self, ctx: &mut ModelContext<Self>) {
         let Some(parent_conversation_id) =
             BlocklistAIHistoryModel::as_ref(ctx).active_conversation_id(self.terminal_view_id)
         else {
@@ -256,14 +247,6 @@ impl OrchestrationViewerModel {
                 status,
             } if *parent_task_id == self.parent_task_id => {
                 self.handle_child_status_changed(run_id, status.clone(), ctx);
-            }
-            #[cfg(target_family = "wasm")]
-            OrchestrationEventStreamerEvent::ViewerModeSeeded {
-                parent_task_id,
-                child_run_ids,
-            } if *parent_task_id == self.parent_task_id => {
-                self.seeded_child_ids = Some(child_run_ids.iter().copied().collect());
-                self.maybe_resolve_initial_child_anchor(ctx);
             }
             // Other orchestrators (or non-viewer-mode variants) are ignored.
             _ => {}
@@ -395,7 +378,7 @@ impl OrchestrationViewerModel {
     /// it in the per-pane map, and requests materialization when current task
     /// state is attachable or transcript-loadable. Idempotent: a second call
     /// for the same `task_id` updates status and materialization state only.
-    fn register_child(&mut self, task: AmbientAgentTask, ctx: &mut ModelContext<Self>) {
+    pub(super) fn register_child(&mut self, task: AmbientAgentTask, ctx: &mut ModelContext<Self>) {
         // The server-side ancestor endpoint includes the parent itself in
         // the response; skip it.
         if task.task_id == self.parent_task_id {
@@ -430,12 +413,19 @@ impl OrchestrationViewerModel {
                 entry.last_state = new_state;
             }
             entry.session_id = session_id;
+            let conversation_id = entry.conversation_id;
             let should_request_materialization =
                 materialization_ready && !entry.pane_materialization_requested;
             if should_request_materialization {
-                let conversation_id = entry.conversation_id;
                 entry.pane_materialization_requested = true;
                 self.request_child_pane_materialization(conversation_id, task, ctx);
+            }
+            #[cfg(any(target_family = "wasm", test))]
+            {
+                ctx.emit(OrchestrationViewerModelEvent::ChildRegistered {
+                    task_id,
+                    conversation_id,
+                });
             }
             // Re-arm the session_id timer; no-op once all children are materialized.
             self.maybe_schedule_pending_session_id_poll(ctx);
@@ -537,88 +527,11 @@ impl OrchestrationViewerModel {
 
         // Arm the session_id refetch timer if the child arrived pre-claim.
         self.maybe_schedule_pending_session_id_poll(ctx);
-        #[cfg(target_family = "wasm")]
-        self.maybe_resolve_initial_child_anchor(ctx);
-    }
-
-    #[cfg(target_family = "wasm")]
-    fn maybe_resolve_initial_child_anchor(&mut self, ctx: &mut ModelContext<Self>) {
-        if self.initial_anchor_resolution_emitted {
-            return;
-        }
-        let Some(seeded_child_ids) = self.seeded_child_ids.as_ref() else {
-            return;
-        };
-        let registered_child_ids = self.children.keys().copied().collect();
-        let conversation_id = match hydrated_anchor_action(
-            self.initial_child_anchor,
-            seeded_child_ids,
-            &registered_child_ids,
-        ) {
-            HydratedAnchorAction::None => {
-                self.initial_anchor_resolution_emitted = true;
-                return;
-            }
-            HydratedAnchorAction::Wait => {
-                let ChildAnchor::Selected(task_id) = self.initial_child_anchor else {
-                    return;
-                };
-                self.fetch_initial_anchor_task(task_id, false, ctx);
-                return;
-            }
-            HydratedAnchorAction::FetchAndVerify(task_id) => {
-                self.fetch_initial_anchor_task(task_id, true, ctx);
-                return;
-            }
-            HydratedAnchorAction::Clear => None,
-            HydratedAnchorAction::Select(task_id) => Some(self.children[&task_id].conversation_id),
-        };
-        self.finish_initial_anchor_resolution(conversation_id, ctx);
-    }
-
-    #[cfg(target_family = "wasm")]
-    fn fetch_initial_anchor_task(
-        &mut self,
-        task_id: AmbientAgentTaskId,
-        verify_parent: bool,
-        ctx: &mut ModelContext<Self>,
-    ) {
-        if self.initial_anchor_fetch_in_flight {
-            return;
-        }
-        self.initial_anchor_fetch_in_flight = true;
-        let ai_client = ServerApiProvider::as_ref(ctx).get_ai_client();
-        let parent_task_id = self.parent_task_id;
-        ctx.spawn(
-            async move { ai_client.get_ambient_agent_task(&task_id).await },
-            move |me, result, ctx| {
-                me.initial_anchor_fetch_in_flight = false;
-                match result {
-                    Ok(task)
-                        if task.task_id == task_id
-                            && (!verify_parent
-                                || is_expected_direct_child(&task, task_id, parent_task_id)) =>
-                    {
-                        me.register_child(task, ctx);
-                    }
-                    Ok(_) | Err(_) => {
-                        me.finish_initial_anchor_resolution(None, ctx);
-                    }
-                }
-            },
-        );
-    }
-
-    #[cfg(target_family = "wasm")]
-    fn finish_initial_anchor_resolution(
-        &mut self,
-        conversation_id: Option<AIConversationId>,
-        ctx: &mut ModelContext<Self>,
-    ) {
-        self.initial_anchor_resolution_emitted = true;
-        if let Some(view) = self.terminal_view.upgrade(ctx) {
-            view.update(ctx, |_view, ctx| {
-                ctx.emit(TerminalViewEvent::RestoreInitialChildAnchor { conversation_id });
+        #[cfg(any(target_family = "wasm", test))]
+        {
+            ctx.emit(OrchestrationViewerModelEvent::ChildRegistered {
+                task_id,
+                conversation_id,
             });
         }
     }
