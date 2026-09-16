@@ -160,6 +160,49 @@ fn case_only_rename_succeeds_without_leaving_temporary_entries() {
         .collect();
     assert_eq!(names, [destination.file_name().unwrap()]);
 }
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[test]
+fn case_only_dangling_symlink_rename_preserves_link_target() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let source = temp_dir.path().join("SourceLink");
+    let destination = temp_dir.path().join("sourcelink");
+    let link_target = std::path::Path::new("MissingTarget");
+
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(link_target, &source).unwrap();
+    #[cfg(target_os = "windows")]
+    std::os::windows::fs::symlink_file(link_target, &source).unwrap();
+
+    rename_noreplace(&source, &destination).unwrap();
+
+    assert_eq!(std::fs::read_link(&destination).unwrap(), link_target);
+    let names: Vec<_> = std::fs::read_dir(temp_dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(names, [destination.file_name().unwrap()]);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[test]
+fn case_only_rename_supports_near_name_max_source() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let source_name = format!("S{}.txt", "a".repeat(250));
+    let destination_name = format!("s{}.txt", "a".repeat(250));
+    let source = temp_dir.path().join(source_name);
+    let destination = temp_dir.path().join(destination_name);
+    std::fs::write(&source, "source").unwrap();
+
+    rename_noreplace(&source, &destination).unwrap();
+
+    assert_eq!(std::fs::read_to_string(&destination).unwrap(), "source");
+    let names: Vec<_> = std::fs::read_dir(temp_dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(names, [destination.file_name().unwrap()]);
+}
 #[test]
 fn move_destination_preserves_file_name() {
     assert_eq!(

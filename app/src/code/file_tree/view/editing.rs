@@ -167,14 +167,66 @@ fn rename_exclusive(_old_path: &Path, _new_path: &Path) -> io::Result<()> {
     ))
 }
 
+#[cfg(unix)]
 fn paths_refer_to_same_entry(old_path: &Path, new_path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
     match (
-        std::fs::canonicalize(old_path),
-        std::fs::canonicalize(new_path),
+        std::fs::symlink_metadata(old_path),
+        std::fs::symlink_metadata(new_path),
     ) {
-        (Ok(old_path), Ok(new_path)) => old_path == new_path,
+        (Ok(old_metadata), Ok(new_metadata)) => {
+            old_metadata.dev() == new_metadata.dev() && old_metadata.ino() == new_metadata.ino()
+        }
         _ => false,
     }
+}
+#[cfg(target_os = "windows")]
+fn paths_refer_to_same_entry(old_path: &Path, new_path: &Path) -> bool {
+    windows_file_identity(old_path)
+        .zip(windows_file_identity(new_path))
+        .is_some_and(|(old_identity, new_identity)| old_identity == new_identity)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_file_identity(path: &Path) -> Option<(u32, u32, u32)> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, GetFileInformationByHandle, OPEN_EXISTING,
+    };
+    use windows::core::{Owned, PCWSTR};
+
+    let path: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: The path pointer remains valid for the call, and the returned handle is owned here.
+    let handle = unsafe {
+        Owned::new(
+            CreateFileW(
+                PCWSTR(path.as_ptr()),
+                FILE_READ_ATTRIBUTES.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                None,
+            )
+            .ok()?,
+        )
+    };
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: The handle is valid and the output pointer refers to initialized writable memory.
+    unsafe { GetFileInformationByHandle(*handle, &mut information) }.ok()?;
+    Some((
+        information.dwVolumeSerialNumber,
+        information.nFileIndexHigh,
+        information.nFileIndexLow,
+    ))
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+fn paths_refer_to_same_entry(_old_path: &Path, _new_path: &Path) -> bool {
+    false
 }
 
 fn rename_noreplace(old_path: &Path, new_path: &Path) -> io::Result<()> {
@@ -182,14 +234,7 @@ fn rename_noreplace(old_path: &Path, new_path: &Path) -> io::Result<()> {
         return rename_exclusive(old_path, new_path);
     }
 
-    let file_name = old_path
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "source has no file name"))?;
-    let temporary_path = old_path.with_file_name(format!(
-        ".{}.warp-rename-{}",
-        file_name.to_string_lossy(),
-        uuid::Uuid::new_v4()
-    ));
+    let temporary_path = old_path.with_file_name(format!(".warp-rename-{}", uuid::Uuid::new_v4()));
 
     rename_exclusive(old_path, &temporary_path)?;
     if let Err(error) = rename_exclusive(&temporary_path, new_path) {
