@@ -224,6 +224,9 @@ impl BaseClient {
     pub fn user_id(&self) -> Option<UserUid> {
         self.auth_state.user_id()
     }
+    pub fn telemetry_user_id(&self) -> Option<String> {
+        self.auth_state.telemetry_user_id()
+    }
 
     /// Returns whether the authenticated principal is a service account.
     pub fn is_service_account(&self) -> bool {
