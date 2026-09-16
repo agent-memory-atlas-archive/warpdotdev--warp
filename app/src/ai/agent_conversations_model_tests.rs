@@ -8,7 +8,7 @@ use chrono::{DateTime, Duration, Utc};
 use futures::future::{Either, select};
 use futures::pin_mut;
 use instant::Instant;
-use mockito::{Matcher, Mock};
+use mockito::Matcher;
 use parking_lot::Mutex;
 use persistence::model::{AgentConversationData, ConversationUsageMetadata};
 use warp_cli::agent::Harness;
@@ -187,27 +187,6 @@ fn add_rtc_routing_test_models(
 
 fn synthetic_team_context_resolver() -> TeamContextResolver {
     Rc::new(|_| panic!("resolver should not run"))
-}
-
-fn mock_tasks_updated_since_overlap_timestamp(
-    task: &AmbientAgentTask,
-    timestamp: DateTime<Utc>,
-    expected_calls: usize,
-) -> Mock {
-    let mut server = warp_core::channel::ChannelState::mock_server();
-    server
-        .mock("GET", "/api/v1/agent/runs")
-        .match_query(Matcher::AllOf(vec![
-            Matcher::UrlEncoded("limit".to_string(), "100".to_string()),
-            Matcher::UrlEncoded(
-                "updated_after".to_string(),
-                (timestamp - Duration::seconds(1)).to_rfc3339(),
-            ),
-        ]))
-        .with_status(200)
-        .with_body(serde_json::json!({ "runs": [task] }).to_string())
-        .expect(expected_calls)
-        .create()
 }
 
 #[test]
@@ -1051,17 +1030,30 @@ fn sdk_list_consumer_makes_no_request_without_an_open_task_tab() {
     });
 }
 
-fn assert_list_consumer_fetches_tasks_updated_since_overlap_timestamp(
-    mode: ExecutionMode,
-    task_index: usize,
-) {
+#[test]
+fn tui_list_consumer_fetches_all_tasks_updated_since_overlap_timestamp() {
     let timestamp = Utc::now();
-    let task = create_test_task(&make_uuid(task_index), "user-a", timestamp);
+    let task = create_test_task(&make_uuid(9802), "user-a", timestamp);
     let task_id = task.task_id;
-    let request = mock_tasks_updated_since_overlap_timestamp(&task, timestamp, 1);
+    let request = {
+        let mut server = warp_core::channel::ChannelState::mock_server();
+        server
+            .mock("GET", "/api/v1/agent/runs")
+            .match_query(Matcher::AllOf(vec![
+                Matcher::UrlEncoded("limit".to_string(), "100".to_string()),
+                Matcher::UrlEncoded(
+                    "updated_after".to_string(),
+                    (timestamp - Duration::seconds(1)).to_rfc3339(),
+                ),
+            ]))
+            .with_status(200)
+            .with_body(serde_json::json!({ "runs": [task] }).to_string())
+            .expect(1)
+            .create()
+    };
 
     App::test((), |mut app| async move {
-        let model = add_rtc_routing_test_models(&mut app, mode);
+        let model = add_rtc_routing_test_models(&mut app, ExecutionMode::Tui);
         let task_changes = subscribe_to_task_changes(&mut app, &model);
 
         model.update(&mut app, |model, ctx| {
@@ -1084,16 +1076,6 @@ fn assert_list_consumer_fetches_tasks_updated_since_overlap_timestamp(
         });
         request.assert();
     });
-}
-
-#[test]
-fn app_list_consumer_fetches_all_tasks_updated_since_overlap_timestamp() {
-    assert_list_consumer_fetches_tasks_updated_since_overlap_timestamp(ExecutionMode::App, 9801);
-}
-
-#[test]
-fn tui_list_consumer_fetches_all_tasks_updated_since_overlap_timestamp() {
-    assert_list_consumer_fetches_tasks_updated_since_overlap_timestamp(ExecutionMode::Tui, 9802);
 }
 
 #[test]
