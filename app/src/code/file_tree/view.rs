@@ -2095,8 +2095,11 @@ impl FileTreeView {
                     if id_for_directory_drop.index > 0
                         && !is_remote
                         && source_root == target.root
-                        && editing::move_destination(&source_path, &target.directory)
-                            .is_some_and(|destination| !destination.to_local_path_lossy().exists())
+                        && editing::move_destination(&source_path, &target.directory).is_some_and(
+                            |destination| {
+                                editing::destination_is_vacant(&destination.to_local_path_lossy())
+                            },
+                        )
                     {
                         AcceptedByDropTarget::Yes
                     } else {
@@ -2181,6 +2184,7 @@ impl FileTreeView {
             }
         }
         self.current_drop_target = None;
+        ctx.reset_cursor();
         ctx.notify();
     }
 

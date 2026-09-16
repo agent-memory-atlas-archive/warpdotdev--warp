@@ -5,6 +5,8 @@
 mod tests;
 
 use std::cmp::Ordering;
+use std::io;
+use std::path::Path;
 use std::sync::Arc;
 
 use repo_metadata::file_tree_store::FileTreeEntryState;
@@ -84,6 +86,69 @@ pub(super) fn move_destination(
     }
 
     Some(target_directory.join(source.file_name()?))
+}
+pub(super) fn destination_is_vacant(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => false,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn path_to_c_string(path: &Path) -> io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+
+    std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+}
+
+#[cfg(target_os = "linux")]
+fn rename_noreplace(old_path: &Path, new_path: &Path) -> io::Result<()> {
+    let old_path = path_to_c_string(old_path)?;
+    let new_path = path_to_c_string(new_path)?;
+    // SAFETY: Both pointers reference valid NUL-terminated paths for the duration of the call.
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            old_path.as_ptr(),
+            libc::AT_FDCWD,
+            new_path.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn rename_noreplace(old_path: &Path, new_path: &Path) -> io::Result<()> {
+    let old_path = path_to_c_string(old_path)?;
+    let new_path = path_to_c_string(new_path)?;
+    // SAFETY: Both pointers reference valid NUL-terminated paths for the duration of the call.
+    let result =
+        unsafe { libc::renamex_np(old_path.as_ptr(), new_path.as_ptr(), libc::RENAME_EXCL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn rename_noreplace(old_path: &Path, new_path: &Path) -> io::Result<()> {
+    std::fs::rename(old_path, new_path)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn rename_noreplace(_old_path: &Path, _new_path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic no-replace rename is unsupported on this platform",
+    ))
 }
 
 impl FileTreeView {
@@ -254,7 +319,7 @@ impl FileTreeView {
         let Some(destination) = move_destination(&source, target_directory) else {
             return;
         };
-        if destination.to_local_path_lossy().exists() {
+        if !destination_is_vacant(&destination.to_local_path_lossy()) {
             return;
         }
 
@@ -277,7 +342,7 @@ impl FileTreeView {
         };
         let old_path = old_std_path.to_local_path_lossy();
         let new_path = new_std_path.to_local_path_lossy();
-        if let Err(e) = std::fs::rename(&old_path, &new_path) {
+        if let Err(e) = rename_noreplace(&old_path, &new_path) {
             log::warn!(
                 "Failed to move {} -> {}: {e}",
                 old_path.display(),

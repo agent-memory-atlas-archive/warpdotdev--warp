@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use pathfinder_geometry::vector::vec2f;
 use repo_metadata::entry::{DirectoryEntry, Entry, FileMetadata};
 use repo_metadata::file_tree_store::FileTreeState;
 use repo_metadata::local_model::IndexedRepoState;
@@ -10,10 +11,11 @@ use repo_metadata::{RepoMetadataModel, RepositoryIdentifier};
 use settings::Setting;
 use virtual_fs::{Stub, VirtualFS};
 use warp_core::ui::appearance::Appearance;
-use warpui::platform::WindowStyle;
-use warpui::{App, ModelHandle, SingletonEntity, TypedActionView};
+use warpui::keymap::Keystroke;
+use warpui::platform::{Cursor, WindowStyle};
+use warpui::{App, EntityIdSet, Event, ModelHandle, SingletonEntity, WindowId, WindowInvalidation};
 
-use super::{FileTreeAction, FileTreeView};
+use super::FileTreeView;
 use crate::auth::AuthStateProvider;
 use crate::server::server_api::team::MockTeamClient;
 use crate::server::server_api::workspace::MockWorkspaceClient;
@@ -49,6 +51,7 @@ fn initialize_app(
     app.add_singleton_model(|ctx| {
         UserWorkspaces::mock(team_client.clone(), workspace_client.clone(), vec![], ctx)
     });
+    app.update(super::init);
 
     let detected_repositories = app.add_singleton_model(|_| DetectedRepositories::default());
     let repository_metadata_model = app.add_singleton_model(RepoMetadataModel::new);
@@ -172,6 +175,60 @@ fn set_show_hidden_files(app: &mut App, show_hidden_files: bool) {
     });
 }
 
+fn simulate_window_event(app: &mut App, window_id: WindowId, event: Event) -> bool {
+    let presenter = app
+        .presenter(window_id)
+        .expect("window should have a presenter")
+        .clone();
+    app.update(move |ctx| ctx.simulate_window_event(event, window_id, presenter))
+}
+fn render_window(app: &mut App, window_id: WindowId) {
+    let presenter = app
+        .presenter(window_id)
+        .expect("window should have a presenter");
+    let mut updated = EntityIdSet::default();
+    updated.insert(
+        app.root_view_id(window_id)
+            .expect("window should have a root view"),
+    );
+    app.update({
+        let presenter = presenter.clone();
+        move |ctx| {
+            let mut presenter = presenter.borrow_mut();
+            presenter.invalidate(
+                WindowInvalidation {
+                    updated,
+                    ..Default::default()
+                },
+                ctx,
+            );
+            presenter.build_scene(vec2f(800., 800.), 1., None, ctx);
+        }
+    });
+}
+
+fn rendered_item_has_background(
+    app: &App,
+    window_id: WindowId,
+    position_id: &str,
+    background: warpui::elements::Fill,
+) -> bool {
+    let presenter = app
+        .presenter(window_id)
+        .expect("window should have a presenter");
+    let presenter = presenter.borrow();
+    let bounds = presenter
+        .position_cache()
+        .get_position(position_id)
+        .expect("item should be rendered");
+    presenter
+        .scene()
+        .expect("window should have a rendered scene")
+        .layers()
+        .flat_map(|layer| &layer.rects)
+        .any(|rect| rect.bounds == bounds && rect.background == background)
+}
+
 #[test]
 fn dropping_file_on_directory_moves_it() {
     VirtualFS::test("file_tree_drop_moves_file", |dirs, mut vfs| {
@@ -213,13 +270,6 @@ fn dropping_file_on_directory_moves_it() {
 
             assert!(!source.exists());
             assert!(destination.exists());
-            await_directory_loaded(
-                &mut app,
-                &repository_metadata_model,
-                &tree,
-                &target_directory,
-            )
-            .await;
             repository_metadata_model.read(&app, |model, ctx| {
                 let id = RepositoryIdentifier::local(std_path(&tree));
                 let entry = &model
@@ -229,7 +279,14 @@ fn dropping_file_on_directory_moves_it() {
                 assert!(!entry.contains(&std_path(&source)));
                 assert!(entry.contains(&std_path(&destination)));
             });
-            file_tree_view.read(&app, |view, _ctx| {
+            await_directory_loaded(
+                &mut app,
+                &repository_metadata_model,
+                &tree,
+                &target_directory,
+            )
+            .await;
+            file_tree_view.read(&app, |view, _| {
                 let paths = flattened_paths(view, &tree);
                 assert!(!paths.contains(&std_path(&source)));
                 assert!(
@@ -350,50 +407,125 @@ fn dropping_item_does_not_overwrite_existing_destination() {
 }
 
 #[test]
-fn cancel_drag_clears_drag_and_target_state() {
+fn escape_key_cancels_rendered_drag() {
     VirtualFS::test("file_tree_cancel_drag", |dirs, mut vfs| {
         vfs.mkdir("tree/target")
             .with_files(vec![Stub::FileWithContent("tree/source.txt", "content")]);
         let tree = dirs.tests().join("tree");
-        let source = std_path(&tree.join("source.txt"));
-        let target = std_path(&tree.join("target"));
+        let source = tree.join("source.txt");
+        let target = tree.join("target");
+        let destination = target.join("source.txt");
 
         App::test((), |mut app| async move {
             let (_, repository_metadata_model) = initialize_app(&mut app);
-            let (_, file_tree_view) = app.add_window(WindowStyle::NotStealFocus, FileTreeView::new);
+            let (window_id, file_tree_view) =
+                app.add_window(WindowStyle::NotStealFocus, FileTreeView::new);
 
             file_tree_view.update(&mut app, |view, ctx| {
                 view.set_is_active(true, ctx);
                 view.set_root_directories(vec![tree.clone()], ctx);
+                ctx.focus_self();
             });
             await_repository_indexed(&mut app, &repository_metadata_model, &tree).await;
+            render_window(&mut app, window_id);
 
-            file_tree_view.update(&mut app, |view, ctx| {
+            let (source_position, target_position) = {
+                let presenter = app
+                    .presenter(window_id)
+                    .expect("window should have a presenter");
+                let presenter = presenter.borrow();
+                let source_bounds = presenter
+                    .position_cache()
+                    .get_position("file_tree_item:source.txt")
+                    .expect("source row should be rendered");
+                let target_bounds = presenter
+                    .position_cache()
+                    .get_position("file_tree_item:target")
+                    .expect("target row should be rendered");
+                (source_bounds.center(), target_bounds.center())
+            };
+
+            assert!(simulate_window_event(
+                &mut app,
+                window_id,
+                Event::LeftMouseDown {
+                    position: source_position,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    is_first_mouse: false,
+                },
+            ));
+            for _ in 0..2 {
+                assert!(simulate_window_event(
+                    &mut app,
+                    window_id,
+                    Event::LeftMouseDragged {
+                        position: target_position,
+                        modifiers: Default::default(),
+                    },
+                ));
+            }
+            file_tree_view.read(&app, |view, _| {
                 let draggable_state = &view
                     .root_directories
                     .get(&std_path(&tree))
-                    .and_then(|root_dir| root_dir.item_states.get(&source))
+                    .and_then(|root_dir| root_dir.item_states.get(&std_path(&source)))
                     .expect("source drag state exists")
                     .1;
-                draggable_state.set_dragging(
-                    pathfinder_geometry::vector::Vector2F::new(10., 10.),
-                    pathfinder_geometry::vector::Vector2F::zero(),
-                );
-                view.current_drop_target = Some(target.clone());
-
-                view.handle_action(&FileTreeAction::CancelDrag, ctx);
+                assert!(draggable_state.is_dragging());
+                assert_eq!(view.current_drop_target, Some(std_path(&target)));
             });
+            render_window(&mut app, window_id);
+            let drop_target_background = app.read(|ctx| {
+                warpui::elements::Fill::from(Appearance::as_ref(ctx).theme().surface_3())
+            });
+            assert!(rendered_item_has_background(
+                &app,
+                window_id,
+                "file_tree_item:target",
+                drop_target_background,
+            ));
+            assert_eq!(app.read(|ctx| ctx.get_cursor_shape()), Cursor::DragCopy);
 
-            file_tree_view.read(&app, |view, _ctx| {
+            assert!(simulate_window_event(
+                &mut app,
+                window_id,
+                Event::KeyDown {
+                    keystroke: Keystroke::parse("escape").unwrap(),
+                    chars: String::new(),
+                    details: Default::default(),
+                    is_composing: false,
+                },
+            ));
+            file_tree_view.read(&app, |view, _| {
                 let draggable_state = &view
                     .root_directories
                     .get(&std_path(&tree))
-                    .and_then(|root_dir| root_dir.item_states.get(&source))
+                    .and_then(|root_dir| root_dir.item_states.get(&std_path(&source)))
                     .expect("source drag state exists")
                     .1;
                 assert!(!draggable_state.is_dragging());
                 assert_eq!(view.current_drop_target, None);
             });
+            render_window(&mut app, window_id);
+            assert!(!rendered_item_has_background(
+                &app,
+                window_id,
+                "file_tree_item:target",
+                drop_target_background,
+            ));
+            assert_eq!(app.read(|ctx| ctx.get_cursor_shape()), Cursor::Arrow);
+
+            simulate_window_event(
+                &mut app,
+                window_id,
+                Event::LeftMouseUp {
+                    position: target_position,
+                    modifiers: Default::default(),
+                },
+            );
+            assert!(source.exists());
+            assert!(destination.symlink_metadata().is_err());
         });
     });
 }
