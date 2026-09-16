@@ -28130,6 +28130,9 @@ impl View for Workspace {
         WorkspaceRegistry::handle(ctx).update(ctx, |registry, _| {
             registry.unregister(window_id);
         });
+        AgentConversationsModel::handle(ctx).update(ctx, |model, ctx| {
+            model.unregister_window(window_id, ctx);
+        });
 
         // If this workspace's close was registered as part of a tab-drag
         // handoff, clear the entry now that the workspace is gone from the

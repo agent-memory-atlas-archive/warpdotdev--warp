@@ -1,14 +1,21 @@
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
+use futures::future::{Either, select};
+use futures::pin_mut;
 use instant::Instant;
+use mockito::Matcher;
 use parking_lot::Mutex;
 use persistence::model::{AgentConversationData, ConversationUsageMetadata};
 use warp_cli::agent::Harness;
+use warp_core::execution_mode::{AppExecutionMode, ExecutionMode};
 use warp_core::features::FeatureFlag;
-use warpui::{App, EntityId, ModelHandle, SingletonEntity};
+use warpui::r#async::Timer;
+use warpui::{App, EntityId, ModelHandle, SingletonEntity, WindowId};
 
 use super::entry::{
     AgentConversationEntryId, AgentConversationNavigationSubject, AgentConversationProvenance,
@@ -41,12 +48,16 @@ use crate::ai::blocklist::history_model::{
 use crate::ai::conversation_navigation::ConversationNavigationData;
 use crate::auth::AuthStateProvider;
 use crate::cloud_object::{Owner, Revision, ServerMetadata, ServerPermissions};
+use crate::server::cloud_objects::update_manager::UpdateManagerEvent;
 use crate::server::ids::ServerId;
+use crate::server::server_api::ServerApiProvider;
 use crate::server::server_api::presigned_upload::HttpStatusError;
 use crate::test_util::ai_agent_tasks::{create_api_task, create_message};
 use crate::test_util::settings::initialize_history_persistence_for_tests;
 use crate::workspace::{WorkspaceAction, WorkspaceRegistry};
-use crate::workspaces::user_workspaces::{TeamContextForOperation, TeamlessScopeForTest};
+use crate::workspaces::user_workspaces::{
+    TeamContextForOperation, TeamContextResolver, TeamlessScopeForTest,
+};
 
 /// Creates a test task with specified creator UID and updated_at time
 fn create_test_task(
@@ -116,6 +127,55 @@ fn subscribe_to_conversation_updated(
         });
     });
     captured
+}
+
+fn subscribe_to_task_changes(
+    app: &mut App,
+    model: &ModelHandle<AgentConversationsModel>,
+) -> async_channel::Receiver<()> {
+    let (sender, receiver) = async_channel::bounded(1);
+    app.update(|ctx| {
+        ctx.subscribe_to_model(model, move |_, event, _| {
+            if matches!(
+                event,
+                AgentConversationsModelEvent::NewTasksReceived
+                    | AgentConversationsModelEvent::TasksUpdated
+            ) {
+                let _ = sender.try_send(());
+            }
+        });
+    });
+    receiver
+}
+
+async fn wait_for_task_change(receiver: &async_channel::Receiver<()>) {
+    let receive = receiver.recv();
+    let deadline = Timer::after(StdDuration::from_secs(1));
+    pin_mut!(receive, deadline);
+    match select(receive, deadline).await {
+        Either::Left((Ok(()), _)) => {}
+        Either::Left((Err(error), _)) => panic!("task-change channel closed: {error}"),
+        Either::Right(_) => panic!("timed out waiting for task change"),
+    }
+}
+
+fn add_rtc_routing_test_models(
+    app: &mut App,
+    mode: ExecutionMode,
+) -> ModelHandle<AgentConversationsModel> {
+    app.add_singleton_model(move |ctx| AppExecutionMode::new(mode, false, ctx));
+    app.add_singleton_model(|_| ServerApiProvider::new_for_test());
+    app.read(|ctx| {
+        ServerApiProvider::as_ref(ctx)
+            .get()
+            .set_ambient_workload_token_for_test("test-workload-token".to_string(), None);
+    });
+    app.add_singleton_model(|_| ActiveAgentViewsModel::new());
+    app.add_singleton_model(|_| create_test_model())
+}
+
+fn synthetic_team_context_resolver() -> TeamContextResolver {
+    Rc::new(|_| panic!("resolver should not run"))
 }
 
 #[test]
@@ -905,6 +965,182 @@ fn rtc_task_refresh_pending_timestamp_replaces_later_timestamp() {
     assert_eq!(pending_timestamp, Some(earliest_timestamp));
 }
 
+#[test]
+fn sdk_list_consumer_records_dirty_timestamp_instead_of_starting_list_refresh() {
+    App::test((), |mut app| async move {
+        let model = add_rtc_routing_test_models(&mut app, ExecutionMode::Sdk);
+        let window_id = WindowId::new();
+        let timestamp = Utc::now();
+        let task_id = make_uuid(9800).parse().unwrap();
+
+        model.update(&mut app, |model, ctx| {
+            model.register_view_open(
+                window_id,
+                EntityId::new(),
+                synthetic_team_context_resolver(),
+                ctx,
+            );
+            model.handle_update_manager_event(
+                &UpdateManagerEvent::AmbientTaskUpdated { task_id, timestamp },
+                ctx,
+            );
+        });
+
+        model.read(&app, |model, _| {
+            assert_eq!(model.dirty_since, Some(timestamp));
+            assert!(matches!(
+                model.rtc_task_refresh_throttle_state,
+                RtcTaskRefreshThrottleState::Idle
+            ));
+        });
+    });
+}
+
+fn assert_list_consumer_fetches_tasks_updated_since_overlap_timestamp(
+    mode: ExecutionMode,
+    task_index: usize,
+) {
+    let timestamp = Utc::now();
+    let updated_after = timestamp - Duration::seconds(1);
+    let task = create_test_task(&make_uuid(task_index), "user-a", timestamp);
+    let task_id = task.task_id;
+    let request = {
+        let mut server = warp_core::channel::ChannelState::mock_server();
+        server
+            .mock("GET", "/api/v1/agent/runs")
+            .match_query(Matcher::AllOf(vec![
+                Matcher::UrlEncoded("limit".to_string(), "100".to_string()),
+                Matcher::UrlEncoded("updated_after".to_string(), updated_after.to_rfc3339()),
+            ]))
+            .with_status(200)
+            .with_body(serde_json::json!({ "runs": [task] }).to_string())
+            .expect(1)
+            .create()
+    };
+
+    App::test((), |mut app| async move {
+        let model = add_rtc_routing_test_models(&mut app, mode);
+        let task_changes = subscribe_to_task_changes(&mut app, &model);
+
+        model.update(&mut app, |model, ctx| {
+            model.register_view_open(
+                WindowId::new(),
+                EntityId::new(),
+                synthetic_team_context_resolver(),
+                ctx,
+            );
+            model.handle_update_manager_event(
+                &UpdateManagerEvent::AmbientTaskUpdated { task_id, timestamp },
+                ctx,
+            );
+        });
+        wait_for_task_change(&task_changes).await;
+
+        model.update(&mut app, |model, _| {
+            assert!(model.get_task_data(&task_id).is_some());
+            model.abort_rtc_task_refresh_throttle();
+        });
+        request.assert();
+    });
+}
+
+#[test]
+fn app_list_consumer_fetches_all_tasks_updated_since_overlap_timestamp() {
+    assert_list_consumer_fetches_tasks_updated_since_overlap_timestamp(ExecutionMode::App, 9801);
+}
+
+#[test]
+fn tui_list_consumer_fetches_all_tasks_updated_since_overlap_timestamp() {
+    assert_list_consumer_fetches_tasks_updated_since_overlap_timestamp(ExecutionMode::Tui, 9802);
+}
+
+#[test]
+fn sdk_open_task_tab_uses_point_fetch_with_registered_list_consumer() {
+    let task = create_test_task(&make_uuid(9803), "user-a", Utc::now());
+    let task_id = task.task_id;
+    let request = {
+        let mut server = warp_core::channel::ChannelState::mock_server();
+        server
+            .mock("GET", format!("/api/v1/agent/runs/{task_id}").as_str())
+            .match_query(Matcher::Missing)
+            .with_status(200)
+            .with_body(serde_json::to_string(&task).unwrap())
+            .expect(1)
+            .create()
+    };
+
+    App::test((), |mut app| async move {
+        let model = add_rtc_routing_test_models(&mut app, ExecutionMode::Sdk);
+        let task_changes = subscribe_to_task_changes(&mut app, &model);
+        ActiveAgentViewsModel::handle(&app).update(&mut app, |active_views, ctx| {
+            active_views.register_ambient_session(EntityId::new(), task_id, ctx);
+        });
+
+        model.update(&mut app, |model, ctx| {
+            model.register_view_open(
+                WindowId::new(),
+                EntityId::new(),
+                synthetic_team_context_resolver(),
+                ctx,
+            );
+            model.handle_update_manager_event(
+                &UpdateManagerEvent::AmbientTaskUpdated {
+                    task_id,
+                    timestamp: Utc::now(),
+                },
+                ctx,
+            );
+        });
+        wait_for_task_change(&task_changes).await;
+
+        model.read(&app, |model, _| {
+            assert_eq!(model.get_task_data(&task_id), Some(task));
+            assert!(matches!(
+                model.rtc_task_refresh_throttle_state,
+                RtcTaskRefreshThrottleState::Idle
+            ));
+        });
+        request.assert();
+    });
+}
+
+#[test]
+fn unregister_window_removes_only_that_windows_list_consumers() {
+    App::test((), |mut app| async move {
+        let model = app.add_singleton_model(|_| create_test_model());
+        let closed_window_id = WindowId::new();
+        let remaining_window_id = WindowId::new();
+
+        model.update(&mut app, |model, ctx| {
+            model.register_view_open(
+                closed_window_id,
+                EntityId::new(),
+                synthetic_team_context_resolver(),
+                ctx,
+            );
+            model.register_view_open(
+                remaining_window_id,
+                EntityId::new(),
+                synthetic_team_context_resolver(),
+                ctx,
+            );
+            model.unregister_window(closed_window_id, ctx);
+        });
+
+        model.read(&app, |model, _| {
+            assert!(
+                !model
+                    .active_data_consumers_per_window
+                    .contains_key(&closed_window_id)
+            );
+            assert!(
+                model
+                    .active_data_consumers_per_window
+                    .contains_key(&remaining_window_id)
+            );
+        });
+    });
+}
 fn create_test_conversation_metadata(
     conversation_id: AIConversationId,
     title: &str,
