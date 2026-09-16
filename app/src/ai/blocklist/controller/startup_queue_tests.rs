@@ -101,7 +101,7 @@ fn startup_injections_queued_before_the_initial_prompt_are_dispatched_one_at_a_t
 }
 
 #[test]
-fn live_injection_while_a_turn_is_active_is_queued_instead_of_interrupting_it() {
+fn live_injection_after_native_setup_interrupts_an_active_turn() {
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);
         let _agent_view = FeatureFlag::AgentView.override_enabled(true);
@@ -122,10 +122,6 @@ fn live_injection_while_a_turn_is_active_is_queued_instead_of_interrupting_it() 
                 .stream_ids_for_conversation(id, ctx)
         });
         assert_eq!(initial_streams.len(), 1);
-
-        // A stream is already active for the conversation, so this must be queued rather than
-        // dispatched immediately -- dispatching now would interrupt prompt1's turn before it
-        // produced any output, silently dropping it.
         controller.update(&mut app, |controller, ctx| {
             controller.execute_warp_agent_prompt_from_shared_session_injection(
                 "prompt2".into(),
@@ -136,28 +132,139 @@ fn live_injection_while_a_turn_is_active_is_queued_instead_of_interrupting_it() 
             );
         });
         controller.read(&app, |controller, ctx| {
+            assert!(!QueuedQueryModel::as_ref(ctx).has_queue(id));
+            let after_streams = controller
+                .in_flight_response_streams
+                .stream_ids_for_conversation(id, ctx);
+            assert_eq!(after_streams.len(), 1);
+            assert_ne!(after_streams, initial_streams);
+        });
+        BlocklistAIHistoryModel::handle(&app).read(&app, |history, _| {
             assert_eq!(
-                QueuedQueryModel::as_ref(ctx)
+                user_queries_in_order(history, id),
+                vec!["prompt1".to_owned(), "prompt2".to_owned()],
+                "the live follow-up should be sent immediately after native setup"
+            );
+        });
+    });
+}
+
+#[test]
+fn live_injection_waits_behind_an_existing_startup_backlog() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let controller = terminal.read(&app, |terminal, _| terminal.ai_controller().clone());
+        let participant = ParticipantId::new();
+        let id = controller.update(&mut app, |controller, ctx| {
+            let id = controller.bind_native_prompt_conversation(None, ctx);
+            controller.execute_warp_agent_prompt_from_shared_session_injection(
+                "prompt2".into(),
+                None,
+                vec![],
+                participant.clone(),
+                ctx,
+            );
+            controller.execute_warp_agent_prompt_from_shared_session_injection(
+                "prompt3".into(),
+                None,
+                vec![],
+                participant.clone(),
+                ctx,
+            );
+            id
+        });
+        terminal.update(&mut app, |terminal, ctx| {
+            terminal.enter_agent_view(None, Some(id), AgentViewEntryOrigin::Cli, ctx);
+        });
+
+        controller.update(&mut app, |controller, ctx| {
+            controller.send_user_query_in_conversation("prompt1".into(), id, None, ctx);
+            controller.dispatch_queued_warp_agent_prompt(id, None, ctx);
+            controller.execute_warp_agent_prompt_from_shared_session_injection(
+                "prompt4".into(),
+                None,
+                vec![],
+                participant,
+                ctx,
+            );
+        });
+
+        QueuedQueryModel::handle(&app).read(&app, |queue, _| {
+            assert_eq!(
+                queue
                     .queue(id)
                     .iter()
                     .map(QueuedQuery::text)
                     .collect::<Vec<_>>(),
-                vec!["prompt2"],
-                "prompt2 should be queued, not dispatched, while prompt1's turn is active"
-            );
-            let after_streams = controller
-                .in_flight_response_streams
-                .stream_ids_for_conversation(id, ctx);
-            assert_eq!(
-                after_streams, initial_streams,
-                "prompt1's stream should be untouched"
+                vec!["prompt3", "prompt4"],
             );
         });
         BlocklistAIHistoryModel::handle(&app).read(&app, |history, _| {
             assert_eq!(
                 user_queries_in_order(history, id),
-                vec!["prompt1".to_owned()],
-                "prompt2 should not have been sent yet"
+                vec!["prompt1".to_owned(), "prompt2".to_owned()],
+            );
+        });
+    });
+}
+
+#[test]
+fn second_live_injection_interrupts_the_first_without_losing_either_prompt() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let controller = terminal.read(&app, |terminal, _| terminal.ai_controller().clone());
+        let id = controller.update(&mut app, |controller, ctx| {
+            controller.bind_native_prompt_conversation(None, ctx)
+        });
+        terminal.update(&mut app, |terminal, ctx| {
+            terminal.enter_agent_view(None, Some(id), AgentViewEntryOrigin::Cli, ctx);
+        });
+
+        let first_injection_streams = controller.update(&mut app, |controller, ctx| {
+            controller.send_user_query_in_conversation("prompt1".into(), id, None, ctx);
+            controller.execute_warp_agent_prompt_from_shared_session_injection(
+                "prompt2".into(),
+                None,
+                vec![],
+                ParticipantId::new(),
+                ctx,
+            );
+            controller
+                .in_flight_response_streams
+                .stream_ids_for_conversation(id, ctx)
+        });
+        assert_eq!(first_injection_streams.len(), 1);
+
+        controller.update(&mut app, |controller, ctx| {
+            controller.execute_warp_agent_prompt_from_shared_session_injection(
+                "prompt3".into(),
+                None,
+                vec![],
+                ParticipantId::new(),
+                ctx,
+            );
+        });
+
+        controller.read(&app, |controller, ctx| {
+            assert!(!QueuedQueryModel::as_ref(ctx).has_queue(id));
+            let second_injection_streams = controller
+                .in_flight_response_streams
+                .stream_ids_for_conversation(id, ctx);
+            assert_eq!(second_injection_streams.len(), 1);
+            assert_ne!(second_injection_streams, first_injection_streams);
+        });
+        BlocklistAIHistoryModel::handle(&app).read(&app, |history, _| {
+            assert_eq!(
+                user_queries_in_order(history, id),
+                vec![
+                    "prompt1".to_owned(),
+                    "prompt2".to_owned(),
+                    "prompt3".to_owned()
+                ],
             );
         });
     });

@@ -80,13 +80,11 @@ impl BlocklistAIController {
     }
 
     /// Routes a shared-session-injected prompt while this controller is bound to a native
-    /// conversation: always queues it (preserving FIFO order with anything already queued),
-    /// then immediately attempts to dispatch the queue's head via
-    /// [`Self::dispatch_queued_warp_agent_prompt`] when nothing is currently streaming for the
-    /// conversation. When a stream *is* active, the row is left queued for the `Steering`
-    /// dispatch mechanism to pick up at the next natural request boundary (or the existing
-    /// idle-triggered drain once the turn finishes) -- dispatching immediately in that case
-    /// would interrupt whatever's already in flight, dropping it before it produces any output.
+    /// conversation. During native setup, injections remain queued in FIFO order behind the
+    /// initial prompt. Once setup finishes, an injection with no older pending rows dispatches
+    /// immediately through the normal follow-up path, interrupting an active LLM turn. An older
+    /// queued row or in-flight attachment download keeps subsequent injections queued so they
+    /// cannot overtake work that has already started.
     ///
     /// Returns `true` when the caller (`execute_warp_agent_prompt_from_shared_session_injection`
     /// and friends) must not fall through to legacy conversation resolution for this prompt:
@@ -142,10 +140,16 @@ impl BlocklistAIController {
             participant_id.clone(),
             attachments.to_vec(),
         );
+        let row_id = row.id();
+        let had_queued_prompts = QueuedQueryModel::as_ref(ctx).has_queue(id);
+        let can_dispatch_live_injection =
+            !QueuedQueryModel::as_ref(ctx).has_pending_native_injections(id);
         QueuedQueryModel::handle(ctx).update(ctx, |queue, ctx| {
             queue.append(id, row, ctx);
         });
-        if self.can_dispatch_queued_warp_agent_prompt(id, ctx) {
+        if can_dispatch_live_injection {
+            self.dispatch_queued_warp_agent_prompt(id, Some(row_id), ctx);
+        } else if had_queued_prompts && self.can_dispatch_queued_warp_agent_prompt(id, ctx) {
             self.dispatch_queued_warp_agent_prompt(id, None, ctx);
         }
         true
@@ -159,9 +163,10 @@ impl BlocklistAIController {
     /// `TerminalInput`/`TerminalView::drain_queued_prompts` to handle instead, since those need
     /// the editor and PTY access this controller doesn't have.
     ///
-    /// `query_id` selects a specific row -- used by an explicit override such as "Send now",
-    /// which may target a row other than the head and is allowed to interrupt an active stream
-    /// on purpose. `None` dispatches the head row in FIFO order, and only if
+    /// `query_id` selects a specific row -- used by an explicit override such as "Send now" or a
+    /// post-setup live injection. Both are allowed to interrupt an active stream on purpose;
+    /// an explicit override may also target a row other than the head. `None` dispatches the head
+    /// row in FIFO order, and only if
     /// [`QueuedQueryModel::peek_autofire`] says it's a plain, unlocked, non-edited row; used by
     /// every automatic trigger, which must check [`Self::can_dispatch_queued_warp_agent_prompt`]
     /// first so this never interrupts an active stream.
