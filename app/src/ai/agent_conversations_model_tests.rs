@@ -8,7 +8,7 @@ use chrono::{DateTime, Duration, Utc};
 use futures::future::{Either, select};
 use futures::pin_mut;
 use instant::Instant;
-use mockito::Matcher;
+use mockito::{Matcher, Mock};
 use parking_lot::Mutex;
 use persistence::model::{AgentConversationData, ConversationUsageMetadata};
 use warp_cli::agent::Harness;
@@ -159,6 +159,17 @@ async fn wait_for_task_change(receiver: &async_channel::Receiver<()>) {
     }
 }
 
+async fn assert_no_task_change(receiver: &async_channel::Receiver<()>) {
+    let receive = receiver.recv();
+    let deadline = Timer::after(StdDuration::from_millis(100));
+    pin_mut!(receive, deadline);
+    match select(receive, deadline).await {
+        Either::Left((Ok(()), _)) => panic!("unexpected task change"),
+        Either::Left((Err(error), _)) => panic!("task-change channel closed: {error}"),
+        Either::Right(_) => {}
+    }
+}
+
 fn add_rtc_routing_test_models(
     app: &mut App,
     mode: ExecutionMode,
@@ -176,6 +187,27 @@ fn add_rtc_routing_test_models(
 
 fn synthetic_team_context_resolver() -> TeamContextResolver {
     Rc::new(|_| panic!("resolver should not run"))
+}
+
+fn mock_tasks_updated_since_overlap_timestamp(
+    task: &AmbientAgentTask,
+    timestamp: DateTime<Utc>,
+    expected_calls: usize,
+) -> Mock {
+    let mut server = warp_core::channel::ChannelState::mock_server();
+    server
+        .mock("GET", "/api/v1/agent/runs")
+        .match_query(Matcher::AllOf(vec![
+            Matcher::UrlEncoded("limit".to_string(), "100".to_string()),
+            Matcher::UrlEncoded(
+                "updated_after".to_string(),
+                (timestamp - Duration::seconds(1)).to_rfc3339(),
+            ),
+        ]))
+        .with_status(200)
+        .with_body(serde_json::json!({ "runs": [task] }).to_string())
+        .expect(expected_calls)
+        .create()
 }
 
 #[test]
@@ -966,16 +998,36 @@ fn rtc_task_refresh_pending_timestamp_replaces_later_timestamp() {
 }
 
 #[test]
-fn sdk_list_consumer_records_dirty_timestamp_instead_of_starting_list_refresh() {
+fn sdk_list_consumer_makes_no_request_without_an_open_task_tab() {
+    let timestamp = Utc::now();
+    let task = create_test_task(&make_uuid(9800), "user-a", timestamp);
+    let task_id = task.task_id;
+    let list_request = {
+        let mut server = warp_core::channel::ChannelState::mock_server();
+        server
+            .mock("GET", "/api/v1/agent/runs")
+            .with_status(200)
+            .with_body(serde_json::json!({ "runs": [&task] }).to_string())
+            .expect(0)
+            .create()
+    };
+    let point_request = {
+        let mut server = warp_core::channel::ChannelState::mock_server();
+        server
+            .mock("GET", format!("/api/v1/agent/runs/{task_id}").as_str())
+            .with_status(200)
+            .with_body(serde_json::to_string(&task).unwrap())
+            .expect(0)
+            .create()
+    };
+
     App::test((), |mut app| async move {
         let model = add_rtc_routing_test_models(&mut app, ExecutionMode::Sdk);
-        let window_id = WindowId::new();
-        let timestamp = Utc::now();
-        let task_id = make_uuid(9800).parse().unwrap();
+        let task_changes = subscribe_to_task_changes(&mut app, &model);
 
         model.update(&mut app, |model, ctx| {
             model.register_view_open(
-                window_id,
+                WindowId::new(),
                 EntityId::new(),
                 synthetic_team_context_resolver(),
                 ctx,
@@ -986,6 +1038,7 @@ fn sdk_list_consumer_records_dirty_timestamp_instead_of_starting_list_refresh() 
             );
         });
 
+        assert_no_task_change(&task_changes).await;
         model.read(&app, |model, _| {
             assert_eq!(model.dirty_since, Some(timestamp));
             assert!(matches!(
@@ -993,6 +1046,8 @@ fn sdk_list_consumer_records_dirty_timestamp_instead_of_starting_list_refresh() 
                 RtcTaskRefreshThrottleState::Idle
             ));
         });
+        list_request.assert();
+        point_request.assert();
     });
 }
 
@@ -1001,22 +1056,9 @@ fn assert_list_consumer_fetches_tasks_updated_since_overlap_timestamp(
     task_index: usize,
 ) {
     let timestamp = Utc::now();
-    let updated_after = timestamp - Duration::seconds(1);
     let task = create_test_task(&make_uuid(task_index), "user-a", timestamp);
     let task_id = task.task_id;
-    let request = {
-        let mut server = warp_core::channel::ChannelState::mock_server();
-        server
-            .mock("GET", "/api/v1/agent/runs")
-            .match_query(Matcher::AllOf(vec![
-                Matcher::UrlEncoded("limit".to_string(), "100".to_string()),
-                Matcher::UrlEncoded("updated_after".to_string(), updated_after.to_rfc3339()),
-            ]))
-            .with_status(200)
-            .with_body(serde_json::json!({ "runs": [task] }).to_string())
-            .expect(1)
-            .create()
-    };
+    let request = mock_tasks_updated_since_overlap_timestamp(&task, timestamp, 1);
 
     App::test((), |mut app| async move {
         let model = add_rtc_routing_test_models(&mut app, mode);
@@ -1105,40 +1147,70 @@ fn sdk_open_task_tab_uses_point_fetch_with_registered_list_consumer() {
 }
 
 #[test]
-fn unregister_window_removes_only_that_windows_list_consumers() {
+fn unregister_and_reregister_window_routes_list_refresh_to_active_consumers() {
+    let first_timestamp = Utc::now();
+    let second_timestamp = first_timestamp + Duration::seconds(2);
+    let first_task = create_test_task(&make_uuid(9804), "user-a", first_timestamp);
+    let second_task = create_test_task(&make_uuid(9804), "user-a", second_timestamp);
+    let task_id = first_task.task_id;
+    let first_request = mock_tasks_updated_since_overlap_timestamp(&first_task, first_timestamp, 1);
+    let second_request =
+        mock_tasks_updated_since_overlap_timestamp(&second_task, second_timestamp, 1);
+
     App::test((), |mut app| async move {
-        let model = app.add_singleton_model(|_| create_test_model());
-        let closed_window_id = WindowId::new();
-        let remaining_window_id = WindowId::new();
+        let model = add_rtc_routing_test_models(&mut app, ExecutionMode::App);
+        let task_changes = subscribe_to_task_changes(&mut app, &model);
+        let reopened_window_id = WindowId::new();
+        let other_window_id = WindowId::new();
 
         model.update(&mut app, |model, ctx| {
             model.register_view_open(
-                closed_window_id,
+                reopened_window_id,
                 EntityId::new(),
                 synthetic_team_context_resolver(),
                 ctx,
             );
             model.register_view_open(
-                remaining_window_id,
+                other_window_id,
                 EntityId::new(),
                 synthetic_team_context_resolver(),
                 ctx,
             );
-            model.unregister_window(closed_window_id, ctx);
+            model.unregister_window(reopened_window_id, ctx);
+            model.handle_update_manager_event(
+                &UpdateManagerEvent::AmbientTaskUpdated {
+                    task_id,
+                    timestamp: first_timestamp,
+                },
+                ctx,
+            );
         });
+        wait_for_task_change(&task_changes).await;
 
-        model.read(&app, |model, _| {
-            assert!(
-                !model
-                    .active_data_consumers_per_window
-                    .contains_key(&closed_window_id)
+        model.update(&mut app, |model, ctx| {
+            model.abort_rtc_task_refresh_throttle();
+            model.register_view_open(
+                reopened_window_id,
+                EntityId::new(),
+                synthetic_team_context_resolver(),
+                ctx,
             );
-            assert!(
-                model
-                    .active_data_consumers_per_window
-                    .contains_key(&remaining_window_id)
+            model.unregister_window(other_window_id, ctx);
+            model.handle_update_manager_event(
+                &UpdateManagerEvent::AmbientTaskUpdated {
+                    task_id,
+                    timestamp: second_timestamp,
+                },
+                ctx,
             );
         });
+        wait_for_task_change(&task_changes).await;
+
+        model.update(&mut app, |model, _| {
+            model.abort_rtc_task_refresh_throttle();
+        });
+        first_request.assert();
+        second_request.assert();
     });
 }
 fn create_test_conversation_metadata(
