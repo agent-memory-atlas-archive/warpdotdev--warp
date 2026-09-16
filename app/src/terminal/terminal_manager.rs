@@ -89,7 +89,7 @@ pub(super) fn compute_block_size(
             appearance.ui_builder().line_height_ratio(),
         )
     } else {
-        // A non-GUI backend has no font since it doesn't render with one. We skip the
+        // A windowless backend has no font since it doesn't render with one. We skip the
         // font-based size computation and hardcode a terminal size, so that viewers of the
         // shared session see a reasonable terminal width.
         SizeInfo::new_without_font_metrics(24, 120)

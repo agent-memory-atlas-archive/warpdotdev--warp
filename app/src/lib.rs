@@ -597,7 +597,7 @@ impl LaunchMode {
 
     /// Whether this launch mode should start the local loopback HTTP server
     /// (`crates/http_server`), which serves app-installation detection and profiling on a
-    /// fixed port. Only GUI instances start it, since co-located non-GUI processes (daemon,
+    /// fixed port. Only GUI instances start it, since co-located windowless processes (daemon,
     /// CLI, proxy, TUI) would otherwise contend for the fixed port.
     #[cfg_attr(target_family = "wasm", allow(dead_code))]
     fn should_start_local_http_server(&self) -> bool {
@@ -1049,7 +1049,7 @@ fn run_internal(mut launch_mode: LaunchMode) -> Result<()> {
     timer.mark_interval_end("LOG_FILE_SETUP_COMPLETE");
 
     // Claim a background-only process type before anything else can reach
-    // AppKit, so a non-GUI launch never acquires a Dock tile. See APP-2946.
+    // AppKit, so a windowless launch never acquires a Dock tile. See APP-2946.
     #[cfg(target_os = "macos")]
     if !launch_mode.is_gui()
         && let Err(e) = platform::mac::mark_process_as_background_only()
@@ -1216,7 +1216,7 @@ fn run_internal(mut launch_mode: LaunchMode) -> Result<()> {
             launch_mode.take_test_driver(),
         )
     } else {
-        warpui::platform::AppBuilder::new_non_gui(
+        warpui::platform::AppBuilder::new_windowless(
             callbacks,
             Box::new(ASSETS),
             launch_mode.take_test_driver(),
@@ -1225,10 +1225,10 @@ fn run_internal(mut launch_mode: LaunchMode) -> Result<()> {
 
     // A user is present for any launch with a UI, so it may query microphone authorization.
     if !launch_mode.is_headless() {
-        app_builder.enable_non_gui_microphone_access_query();
+        app_builder.enable_windowless_microphone_access_query();
     }
 
-    // A non-GUI invocation has no Dock presence, so it performs no Dock-visible
+    // A windowless invocation has no Dock presence, so it performs no Dock-visible
     // setup at all (Dock icon, Dock menu, menu bar). See APP-2946.
     #[cfg(target_os = "macos")]
     if launch_mode.is_gui() {

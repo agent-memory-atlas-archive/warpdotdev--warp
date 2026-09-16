@@ -289,7 +289,7 @@ pub trait Delegate: 'static {
     fn microphone_access_state(&self) -> MicrophoneAccessState;
 
     /// Returns whether the app is running on a GUI backend that renders to native windows,
-    /// as opposed to a non-GUI backend with no fonts, native windows, or GPU rendering.
+    /// as opposed to a windowless backend with no fonts, native windows, or GPU rendering.
     fn is_gui(&self) -> bool {
         true
     }
