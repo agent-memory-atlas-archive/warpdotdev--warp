@@ -64,7 +64,6 @@ use crate::ai::predict::generate_am_query_suggestions::GenerateAMQuerySuggestion
 use crate::ai::predict::predict_am_queries::{PredictAMQueriesRequest, PredictAMQueriesResponse};
 use crate::ai::predict::{generate_ai_input_suggestions, generate_am_query_suggestions};
 use crate::ai::voice::transcribe::{TranscribeRequest, TranscribeResponse};
-use crate::auth::UserUid;
 use crate::auth::auth_manager::AuthManager;
 use crate::auth::auth_state::AuthState;
 use crate::server::team_scope::RequestTeamScope;
@@ -1086,7 +1085,7 @@ impl ServerApi {
         event: impl TelemetryEvent,
         settings_snapshot: PrivacySettingsSnapshot,
     ) -> Result<()> {
-        let user_id = self.telemetry_user_id().map(|id| UserUid::new(&id));
+        let user_id = self.telemetry_user_id();
         let anonymous_id = self.anonymous_id();
         self.telemetry_api
             .send_telemetry_event(user_id, anonymous_id, event, settings_snapshot)

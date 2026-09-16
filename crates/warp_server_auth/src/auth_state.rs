@@ -486,6 +486,7 @@ impl AuthState {
     pub fn user_id(&self) -> Option<UserUid> {
         self.user.read().as_ref().map(|user| user.local_id)
     }
+
     /// Returns the authenticated principal identifier used for telemetry.
     pub fn telemetry_user_id(&self) -> Option<String> {
         let user = self.user.read();

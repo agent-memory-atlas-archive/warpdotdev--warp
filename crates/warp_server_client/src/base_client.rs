@@ -224,6 +224,7 @@ impl BaseClient {
     pub fn user_id(&self) -> Option<UserUid> {
         self.auth_state.user_id()
     }
+
     pub fn telemetry_user_id(&self) -> Option<String> {
         self.auth_state.telemetry_user_id()
     }
