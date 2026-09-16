@@ -104,7 +104,7 @@ fn path_to_c_string(path: &Path) -> io::Result<std::ffi::CString> {
 }
 
 #[cfg(target_os = "linux")]
-fn rename_noreplace(old_path: &Path, new_path: &Path) -> io::Result<()> {
+fn rename_exclusive(old_path: &Path, new_path: &Path) -> io::Result<()> {
     let old_path = path_to_c_string(old_path)?;
     let new_path = path_to_c_string(new_path)?;
     // SAFETY: Both pointers reference valid NUL-terminated paths for the duration of the call.
@@ -125,7 +125,7 @@ fn rename_noreplace(old_path: &Path, new_path: &Path) -> io::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn rename_noreplace(old_path: &Path, new_path: &Path) -> io::Result<()> {
+fn rename_exclusive(old_path: &Path, new_path: &Path) -> io::Result<()> {
     let old_path = path_to_c_string(old_path)?;
     let new_path = path_to_c_string(new_path)?;
     // SAFETY: Both pointers reference valid NUL-terminated paths for the duration of the call.
@@ -139,16 +139,70 @@ fn rename_noreplace(old_path: &Path, new_path: &Path) -> io::Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-fn rename_noreplace(old_path: &Path, new_path: &Path) -> io::Result<()> {
-    std::fs::rename(old_path, new_path)
+fn rename_exclusive(old_path: &Path, new_path: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows::Win32::Storage::FileSystem::{MOVE_FILE_FLAGS, MoveFileExW};
+    use windows::core::PCWSTR;
+
+    let old_path: Vec<_> = old_path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let new_path: Vec<_> = new_path.as_os_str().encode_wide().chain(Some(0)).collect();
+
+    // SAFETY: Both pointers reference valid NUL-terminated paths for the duration of the call.
+    unsafe {
+        MoveFileExW(
+            PCWSTR(old_path.as_ptr()),
+            PCWSTR(new_path.as_ptr()),
+            MOVE_FILE_FLAGS(0),
+        )
+    }
+    .map_err(|_| io::Error::last_os_error())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn rename_noreplace(_old_path: &Path, _new_path: &Path) -> io::Result<()> {
+fn rename_exclusive(_old_path: &Path, _new_path: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "atomic no-replace rename is unsupported on this platform",
     ))
+}
+
+fn paths_refer_to_same_entry(old_path: &Path, new_path: &Path) -> bool {
+    match (
+        std::fs::canonicalize(old_path),
+        std::fs::canonicalize(new_path),
+    ) {
+        (Ok(old_path), Ok(new_path)) => old_path == new_path,
+        _ => false,
+    }
+}
+
+fn rename_noreplace(old_path: &Path, new_path: &Path) -> io::Result<()> {
+    if !paths_refer_to_same_entry(old_path, new_path) {
+        return rename_exclusive(old_path, new_path);
+    }
+
+    let file_name = old_path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "source has no file name"))?;
+    let temporary_path = old_path.with_file_name(format!(
+        ".{}.warp-rename-{}",
+        file_name.to_string_lossy(),
+        uuid::Uuid::new_v4()
+    ));
+
+    rename_exclusive(old_path, &temporary_path)?;
+    if let Err(error) = rename_exclusive(&temporary_path, new_path) {
+        if let Err(rollback_error) = rename_exclusive(&temporary_path, old_path) {
+            log::error!(
+                "Failed to restore {} after case-only rename failed: {rollback_error}",
+                old_path.display()
+            );
+        }
+        return Err(error);
+    }
+
+    Ok(())
 }
 
 impl FileTreeView {

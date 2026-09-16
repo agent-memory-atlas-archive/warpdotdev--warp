@@ -10,6 +10,7 @@ use warp_core::features::FeatureFlag;
 use warp_core::ui::appearance::Appearance;
 use warp_core::ui::icons::ICON_DIMENSIONS;
 use warp_editor::render::element::VerticalExpansionBehavior;
+use warp_util::file::FileId;
 use warp_util::path::LineAndColumnArg;
 #[cfg(feature = "local_fs")]
 use warpui::clipboard::ClipboardContent;
@@ -39,7 +40,7 @@ use super::local_code_editor::{LocalCodeEditorEvent, LocalCodeEditorView};
 use crate::code::editor::scroll::ScrollPosition;
 use crate::code::editor::view::CodeEditorRenderOptions;
 use crate::code::editor_management::CodeEditorStatus;
-use crate::code::global_buffer_model::GlobalBufferModel;
+use crate::code::global_buffer_model::{BufferState, GlobalBufferModel};
 use crate::code::local_code_editor::ShowFindReferencesCard;
 use crate::code::{EditorTabBarDropTargetData, ImmediateSaveError, SaveOutcome, SaveStatus};
 use crate::editor::InteractionState;
@@ -1434,6 +1435,7 @@ impl CodeView {
         &mut self,
         old_path: &Path,
         new_path: &Path,
+        renamed_buffers: &HashMap<FileId, BufferState>,
         ctx: &mut ViewContext<Self>,
     ) {
         for tab in self.tab_group.iter_mut() {
@@ -1448,13 +1450,10 @@ impl CodeView {
             tab.editor_view.update(ctx, |editor, ctx| {
                 let was_unsaved = editor.has_unsaved_changes(ctx);
 
-                if let Some(old_file_id) = editor.file_id() {
-                    let buffer_state = GlobalBufferModel::handle(ctx).update(ctx, |model, ctx| {
-                        model.rename(old_file_id, renamed_path.clone(), ctx)
-                    });
-                    if let Some(buffer_state) = buffer_state {
-                        editor.apply_rename(buffer_state, &renamed_path, ctx);
-                    }
+                if let Some(old_file_id) = editor.file_id()
+                    && let Some(buffer_state) = renamed_buffers.get(&old_file_id)
+                {
+                    editor.apply_rename(buffer_state.clone(), &renamed_path, ctx);
                 }
 
                 if was_unsaved {

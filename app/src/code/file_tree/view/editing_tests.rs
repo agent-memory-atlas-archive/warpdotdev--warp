@@ -143,6 +143,23 @@ fn atomic_move_does_not_overwrite_racing_destination() {
     );
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[test]
+fn case_only_rename_succeeds_without_leaving_temporary_entries() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let source = temp_dir.path().join("Source.txt");
+    let destination = temp_dir.path().join("source.txt");
+    std::fs::write(&source, "source").unwrap();
+
+    rename_noreplace(&source, &destination).unwrap();
+
+    assert_eq!(std::fs::read_to_string(&destination).unwrap(), "source");
+    let names: Vec<_> = std::fs::read_dir(temp_dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(names, [destination.file_name().unwrap()]);
+}
 #[test]
 fn move_destination_preserves_file_name() {
     assert_eq!(
