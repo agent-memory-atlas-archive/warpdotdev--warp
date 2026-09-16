@@ -974,7 +974,7 @@ fn rtc_task_refresh_fetches_first_task_by_id() {
 }
 
 #[test]
-fn rtc_task_refresh_deduplicates_tasks_in_trailing_flush() {
+fn rtc_task_refresh_coalesces_duplicate_updates_into_trailing_lookups() {
     let leading_task = create_test_task(&make_uuid(9801), "user-a", Utc::now());
     let trailing_task = create_test_task(&make_uuid(9802), "user-a", Utc::now());
     let leading_task_id = leading_task.task_id;
@@ -988,7 +988,7 @@ fn rtc_task_refresh_deduplicates_tasks_in_trailing_flush() {
             )
             .with_status(200)
             .with_body(serde_json::to_string(&leading_task).unwrap())
-            .expect(1)
+            .expect(2)
             .create();
         let trailing_request = server
             .mock(
@@ -1019,6 +1019,7 @@ fn rtc_task_refresh_deduplicates_tasks_in_trailing_flush() {
 
         model.update(&mut app, |model, ctx| {
             model.handle_rtc_for_list_views(leading_task_id, ctx);
+            model.handle_rtc_for_list_views(leading_task_id, ctx);
             model.handle_rtc_for_list_views(trailing_task_id, ctx);
             model.handle_rtc_for_list_views(trailing_task_id, ctx);
         });
@@ -1027,6 +1028,7 @@ fn rtc_task_refresh_deduplicates_tasks_in_trailing_flush() {
             super::RTC_TASK_REFRESH_THROTTLE + StdDuration::from_secs(1),
         )
         .await;
+        wait_for_task_update(&task_updates, StdDuration::from_secs(1)).await;
 
         model.update(&mut app, |model, _| {
             assert_eq!(model.get_task_data(&trailing_task_id), Some(trailing_task));
