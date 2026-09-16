@@ -1,35 +1,43 @@
-use serde_json::Value;
+use serde_json::{Value, json};
 use strum_macros::{EnumDiscriminants, EnumIter};
 use warp_core::telemetry::{EnablementState, TelemetryEvent, TelemetryEventDesc};
 
+use super::FeatureIntroId;
+
+/// Telemetry for reusable feature-intro popovers.
 #[derive(Debug, EnumDiscriminants)]
 #[strum_discriminants(derive(EnumIter))]
-pub enum FactoriesLaunchModalTelemetryEvent {
-    Shown,
-    Dismissed,
-    CtaClicked,
+pub enum FeatureIntroModalTelemetryEvent {
+    Shown { feature: FeatureIntroId },
+    Dismissed { feature: FeatureIntroId },
+    CtaClicked { feature: FeatureIntroId },
 }
 
-impl TelemetryEvent for FactoriesLaunchModalTelemetryEvent {
+impl TelemetryEvent for FeatureIntroModalTelemetryEvent {
     fn name(&self) -> &'static str {
-        FactoriesLaunchModalTelemetryEventDiscriminants::from(self).name()
+        FeatureIntroModalTelemetryEventDiscriminants::from(self).name()
     }
 
     fn payload(&self) -> Option<Value> {
-        None
+        let feature = match self {
+            Self::Shown { feature }
+            | Self::Dismissed { feature }
+            | Self::CtaClicked { feature } => feature.as_key(),
+        };
+        Some(json!({ "feature": feature }))
     }
 
     fn description(&self) -> &'static str {
-        FactoriesLaunchModalTelemetryEventDiscriminants::from(self).description()
+        FeatureIntroModalTelemetryEventDiscriminants::from(self).description()
     }
 
     fn enablement_state(&self) -> EnablementState {
-        FactoriesLaunchModalTelemetryEventDiscriminants::from(self).enablement_state()
+        FeatureIntroModalTelemetryEventDiscriminants::from(self).enablement_state()
     }
 
     fn contains_ugc(&self) -> bool {
         match self {
-            Self::Shown | Self::Dismissed | Self::CtaClicked => false,
+            Self::Shown { .. } | Self::Dismissed { .. } | Self::CtaClicked { .. } => false,
         }
     }
 
@@ -38,20 +46,20 @@ impl TelemetryEvent for FactoriesLaunchModalTelemetryEvent {
     }
 }
 
-impl TelemetryEventDesc for FactoriesLaunchModalTelemetryEventDiscriminants {
+impl TelemetryEventDesc for FeatureIntroModalTelemetryEventDiscriminants {
     fn name(&self) -> &'static str {
         match self {
-            Self::Shown => "FactoriesLaunchModal.Shown",
-            Self::Dismissed => "FactoriesLaunchModal.Dismissed",
-            Self::CtaClicked => "FactoriesLaunchModal.CtaClicked",
+            Self::Shown => "FeatureIntroModal.Shown",
+            Self::Dismissed => "FeatureIntroModal.Dismissed",
+            Self::CtaClicked => "FeatureIntroModal.CtaClicked",
         }
     }
 
     fn description(&self) -> &'static str {
         match self {
-            Self::Shown => "The Factories launch modal was shown to the user",
-            Self::Dismissed => "The user dismissed the Factories launch modal",
-            Self::CtaClicked => "The user clicked the call-to-action in the Factories launch modal",
+            Self::Shown => "A feature-intro popover was shown to the user",
+            Self::Dismissed => "The user dismissed a feature-intro popover",
+            Self::CtaClicked => "The user clicked the call-to-action in a feature-intro popover",
         }
     }
 
@@ -62,4 +70,4 @@ impl TelemetryEventDesc for FactoriesLaunchModalTelemetryEventDiscriminants {
     }
 }
 
-warp_core::register_telemetry_event!(FactoriesLaunchModalTelemetryEvent);
+warp_core::register_telemetry_event!(FeatureIntroModalTelemetryEvent);

@@ -10,8 +10,11 @@ use warp_util::sync::Condition;
 use warpui::{AppContext, Entity, ModelContext, SingletonEntity, WindowId};
 
 use super::hoa_onboarding;
+use super::view::factories_launch_modal::{
+    FACTORIES_LAUNCH_SEEN_KEY, FactoriesLaunchModalTelemetryEvent,
+};
 use super::view::feature_intro_modal::{
-    FEATURE_INTROS, FactoriesLaunchModalTelemetryEvent, FeatureIntroId,
+    FEATURE_INTROS, FeatureIntroId, FeatureIntroModalTelemetryEvent,
 };
 use super::view::free_ai_removal_modal::{
     FreeAiRemovalModalTelemetryEvent, FreeAiRemovalModalVariant,
@@ -59,6 +62,8 @@ pub struct OneTimeModalModel {
     is_free_ai_removal_modal_open: bool,
     /// Whether the HOA onboarding flow is currently being shown.
     is_hoa_onboarding_open: bool,
+    /// Whether the Factories launch modal is currently being shown.
+    is_factories_launch_modal_open: bool,
     /// The feature-intro popover currently being shown, if any. Unlike the other
     /// one-time modals this is a non-blocking bottom-right popover, so it is
     /// intentionally excluded from `is_any_modal_open` (which suppresses terminal
@@ -95,6 +100,7 @@ impl OneTimeModalModel {
                         me.has_fetched_workspaces = true;
                         me.maybe_recheck_free_ai_removal_modal(ctx);
                         me.maybe_recheck_feature_intro_modal(ctx);
+                        me.maybe_recheck_factories_launch_modal(ctx);
                     }
                     _ => {}
                 }
@@ -156,6 +162,7 @@ impl OneTimeModalModel {
                     for intro in FEATURE_INTROS {
                         settings.mark_feature_intro_seen(intro.id.as_key(), ctx);
                     }
+                    settings.mark_feature_intro_seen(FACTORIES_LAUNCH_SEEN_KEY, ctx);
                 });
                 // Accounts created after the removal of free AI go through the new
                 // onboarding and are treated as already-noticed (no modal).
@@ -188,6 +195,7 @@ impl OneTimeModalModel {
             auto_handoff_sleep_modal_closed,
             is_free_ai_removal_modal_open: false,
             is_hoa_onboarding_open: false,
+            is_factories_launch_modal_open: false,
             active_feature_intro: None,
             factories_launch_intro_claim_in_flight: false,
             has_completed_initial_modal_checks: false,
@@ -256,6 +264,9 @@ impl OneTimeModalModel {
 
     fn resume_modal_checks_after_feature_intro(&mut self, ctx: &mut ModelContext<Self>) {
         if self.check_and_trigger_free_ai_removal_modal(ctx) {
+            return;
+        }
+        if self.check_and_trigger_factories_launch_modal(ctx) {
             return;
         }
         if self.check_and_trigger_hoa_onboarding(ctx) {
@@ -368,6 +379,40 @@ impl OneTimeModalModel {
     pub fn mark_hoa_onboarding_dismissed(&mut self, ctx: &mut ModelContext<Self>) {
         self.set_hoa_onboarding_open(false, ctx);
     }
+    pub fn is_factories_launch_modal_open(&self) -> bool {
+        self.is_factories_launch_modal_open && self.target_window_id.is_some()
+    }
+
+    pub fn mark_factories_launch_modal_dismissed(&mut self, ctx: &mut ModelContext<Self>) {
+        if self.set_factories_launch_modal_open(false, ctx) {
+            self.resume_modal_checks_after_factories_launch(ctx);
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn force_open_factories_launch_modal(&mut self, ctx: &mut ModelContext<Self>) {
+        self.set_factories_launch_modal_open(true, ctx);
+    }
+
+    fn set_factories_launch_modal_open(
+        &mut self,
+        is_open: bool,
+        ctx: &mut ModelContext<Self>,
+    ) -> bool {
+        if self.is_factories_launch_modal_open == is_open {
+            return false;
+        }
+        self.is_factories_launch_modal_open = is_open;
+        ctx.emit(OneTimeModalEvent::VisibilityChanged { is_open });
+        true
+    }
+
+    fn resume_modal_checks_after_factories_launch(&mut self, ctx: &mut ModelContext<Self>) {
+        if self.check_and_trigger_hoa_onboarding(ctx) {
+            return;
+        }
+        self.check_and_trigger_build_plan_migration_modal(ctx);
+    }
 
     /// Returns true if any one-time modal is currently open.
     pub fn is_any_modal_open(&self) -> bool {
@@ -378,6 +423,8 @@ impl OneTimeModalModel {
             || self.is_auto_handoff_sleep_modal_open
             || self.is_build_plan_migration_modal_open
             || self.is_free_ai_removal_modal_open
+            || self.is_factories_launch_modal_open
+            || self.factories_launch_intro_claim_in_flight
             || self.is_hoa_onboarding_open)
             && self.target_window_id.is_some()
     }
@@ -513,6 +560,9 @@ impl OneTimeModalModel {
         }
 
         if self.check_and_trigger_feature_intro_modal(ctx) {
+            return;
+        }
+        if self.check_and_trigger_factories_launch_modal(ctx) {
             return;
         }
 
@@ -780,14 +830,11 @@ impl OneTimeModalModel {
     }
 
     fn check_and_trigger_feature_intro_modal(&mut self, ctx: &mut ModelContext<Self>) -> bool {
-        if self.factories_launch_intro_claim_in_flight {
-            return true;
-        }
         let next_id = FEATURE_INTROS
             .iter()
             .find(|intro| {
                 !AISettings::as_ref(ctx).is_feature_intro_seen(intro.id.as_key())
-                    && intro.id.is_eligible(ctx)
+                    && (intro.eligible)(ctx)
             })
             .map(|intro| intro.id);
         let Some(id) = next_id else {
@@ -795,44 +842,70 @@ impl OneTimeModalModel {
         };
 
         let should_show = !matches!(ChannelState::channel(), Channel::Integration);
-        if id == FeatureIntroId::FactoriesLaunch && should_show {
-            self.factories_launch_intro_claim_in_flight = true;
-            let auth_client = self.auth_client.clone();
-            let _ = ctx.spawn(
-                async move { auth_client.claim_factories_launch_intro().await },
-                move |me, result, ctx| {
-                    me.factories_launch_intro_claim_in_flight = false;
-                    match result {
-                        Ok(claimed) => {
-                            AISettings::handle(ctx).update(ctx, |settings, ctx| {
-                                settings.mark_feature_intro_seen(id.as_key(), ctx);
-                            });
-                            if claimed && me.set_active_feature_intro(Some(id), ctx) {
-                                send_telemetry_from_ctx!(
-                                    FactoriesLaunchModalTelemetryEvent::Shown,
-                                    ctx
-                                );
-                            } else if !claimed {
-                                me.resume_modal_checks_after_feature_intro(ctx);
-                            }
-                        }
-                        Err(error) => {
-                            log::warn!("Failed to claim Factories launch intro: {error:#}");
-                            me.resume_modal_checks_after_feature_intro(ctx);
-                        }
-                    }
-                },
-            );
-            return true;
-        }
 
         AISettings::handle(ctx).update(ctx, |settings, ctx| {
             settings.mark_feature_intro_seen(id.as_key(), ctx);
         });
-        if should_show {
-            self.set_active_feature_intro(Some(id), ctx);
+        if should_show && self.set_active_feature_intro(Some(id), ctx) {
+            send_telemetry_from_ctx!(FeatureIntroModalTelemetryEvent::Shown { feature: id }, ctx);
         }
         should_show
+    }
+
+    fn maybe_recheck_factories_launch_modal(&mut self, ctx: &mut ModelContext<Self>) {
+        if !self.has_completed_initial_modal_checks
+            || self.is_any_modal_open()
+            || self.active_feature_intro.is_some()
+        {
+            return;
+        }
+        self.check_and_trigger_factories_launch_modal(ctx);
+    }
+
+    fn check_and_trigger_factories_launch_modal(&mut self, ctx: &mut ModelContext<Self>) -> bool {
+        if !FeatureFlag::FactoriesLaunchModal.is_enabled()
+            || AISettings::as_ref(ctx).is_feature_intro_seen(FACTORIES_LAUNCH_SEEN_KEY)
+            || self.factories_launch_intro_claim_in_flight
+            || UserWorkspaces::as_ref(ctx)
+                .factories_launch_modal_cta_url()
+                .is_none_or(|url| url.trim().is_empty())
+        {
+            return false;
+        }
+
+        if matches!(ChannelState::channel(), Channel::Integration) {
+            return false;
+        }
+
+        self.factories_launch_intro_claim_in_flight = true;
+        let auth_client = self.auth_client.clone();
+        let _ = ctx.spawn(
+            async move { auth_client.claim_factories_launch_intro().await },
+            move |me, result, ctx| {
+                me.factories_launch_intro_claim_in_flight = false;
+                match result {
+                    Ok(claimed) => {
+                        AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                            settings.mark_feature_intro_seen(FACTORIES_LAUNCH_SEEN_KEY, ctx);
+                        });
+                        if claimed {
+                            me.set_factories_launch_modal_open(true, ctx);
+                            send_telemetry_from_ctx!(
+                                FactoriesLaunchModalTelemetryEvent::Shown,
+                                ctx
+                            );
+                        } else {
+                            me.resume_modal_checks_after_factories_launch(ctx);
+                        }
+                    }
+                    Err(error) => {
+                        log::warn!("Failed to claim Factories launch intro: {error:#}");
+                        me.resume_modal_checks_after_factories_launch(ctx);
+                    }
+                }
+            },
+        );
+        true
     }
 
     pub fn is_build_plan_migration_modal_open(&self) -> bool {
