@@ -15,6 +15,10 @@ fn telemetry_user_id_prefixes_service_account_uid() {
         "01994db3-4b84-7dd7-88ba-052af4edbbd9",
         PrincipalType::ServiceAccount,
     );
+    assert_eq!(
+        auth_state.user_id(),
+        Some(UserUid::new("01994db3-4b84-7dd7-88ba-052af4edbbd9"))
+    );
 
     assert_eq!(
         auth_state.telemetry_user_id().as_deref(),
