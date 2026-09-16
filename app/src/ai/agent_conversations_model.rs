@@ -1173,6 +1173,13 @@ impl AgentConversationsModel {
         self.update_polling_state(ctx);
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_data_consumers_for_window(&self, window_id: WindowId) -> bool {
+        self.active_data_consumers_per_window
+            .get(&window_id)
+            .is_some_and(|views| !views.is_empty())
+    }
+
     /// Updates the polling state based on whether the active window has the view open.
     fn update_polling_state(&mut self, ctx: &mut ModelContext<Self>) {
         match self.polling_team_context_resolver(ctx) {
